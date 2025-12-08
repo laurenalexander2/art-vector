@@ -39,7 +39,6 @@ UNEMBEDDED_INDICES: List[int] = []
 
 # -----------------------
 # Helpers
-# -----------------------
 def _build_object_from_row(row: Dict[str, str]) -> Optional[Dict[str, Any]]:
     img = row.get("PrimaryImage") or row.get("PrimaryImageSmall")
     # Do NOT skip rows missing image
