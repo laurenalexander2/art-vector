@@ -1,17 +1,73 @@
-import csv
 import io
-import os
+import csv
 import json
-from typing import List, Dict, Any, Optional
+import os
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import torch
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from .embedding import embed_text
+from .embedding import embed_texts
 
-app = FastAPI(title="ArtVector – Semantic Search for Museum Data")
+DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+DATA_PATH.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_PATH / "artvector.db"
+
+EMBEDDING_DIM = 384  # all-MiniLM-L6-v2
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS datasets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset_id TEXT UNIQUE,
+            name TEXT,
+            source_type TEXT,
+            original_filename TEXT,
+            created_at TEXT,
+            metadata_fields TEXT,
+            num_objects INTEGER DEFAULT 0
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS objects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            object_uid TEXT UNIQUE,
+            dataset_id TEXT,
+            original_id TEXT,
+            title TEXT,
+            artist TEXT,
+            image_url TEXT,
+            has_image INTEGER,
+            raw_metadata TEXT,
+            embedding TEXT,
+            FOREIGN KEY(dataset_id) REFERENCES datasets(dataset_id)
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_objects_dataset ON objects(dataset_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_objects_embedding_null ON objects(embedding);")
+    conn.commit()
+    conn.close()
+
+init_db()
+
+app = FastAPI(title="ArtVector API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,286 +77,312 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------
-# Persistent storage paths
-# -----------------------
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
-OBJECTS_PATH = os.path.join(DATA_DIR, "objects.json")
-EMBEDDINGS_PATH = os.path.join(DATA_DIR, "embeddings.pt")
-INDICES_PATH = os.path.join(DATA_DIR, "indices.json")
-os.makedirs(DATA_DIR, exist_ok=True)
+class DatasetOut(BaseModel):
+    dataset_id: str
+    name: Optional[str]
+    source_type: Optional[str]
+    original_filename: Optional[str]
+    created_at: Optional[str]
+    metadata_fields: List[str]
+    num_objects: int
 
-# In-memory "database"
-OBJECTS: List[Dict[str, Any]] = []
-EMBEDDINGS: Optional[torch.Tensor] = None
-EMBEDDED_INDICES: List[int] = []
-UNEMBEDDED_INDICES: List[int] = []
+class ObjectOut(BaseModel):
+    object_uid: str
+    dataset_id: str
+    original_id: Optional[str]
+    title: Optional[str]
+    artist: Optional[str]
+    image_url: Optional[str]
+    has_image: bool
+    raw_metadata: dict
 
+class SearchResult(BaseModel):
+    score: float
+    obj: ObjectOut
 
-# -----------------------
-# Helpers
-def _build_object_from_row(row: Dict[str, str]) -> Optional[Dict[str, Any]]:
-    img = row.get("PrimaryImage") or row.get("PrimaryImageSmall")
-    # Do NOT skip rows missing image
-    # museums often separate metadata and media
-    return {
-        "id": row.get("ObjectID") or "",
-        "title": row.get("Title") or "",
-        "artist_display": row.get("ArtistDisplayName") or "",
-        "medium": row.get("Medium") or "",
-        "department": row.get("Department") or "",
-        "description": row.get("ObjectName") or "",
-        "image_url": img,  # may be None
-        "object_url": row.get("ObjectURL") or "",
-    }
+def register_dataset(name: str, filename: str, fields: List[str], source_type: str = "museum") -> str:
+    dataset_id = f"{name.lower().replace(' ', '_')}_{int(time.time())}"
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO datasets (dataset_id, name, source_type, original_filename, created_at, metadata_fields)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            dataset_id,
+            name,
+            source_type,
+            filename,
+            datetime.utcnow().isoformat(),
+            json.dumps(fields),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return dataset_id
 
+def build_object_uid(dataset_id: str, original_id: str) -> str:
+    return f"{dataset_id}__{original_id}"
 
-def _build_text_for_object(obj: Dict[str, Any]) -> str:
-    parts = [
-        obj.get("title") or "",
-        obj.get("artist_display") or "",
-        obj.get("medium") or "",
-        obj.get("department") or "",
-        obj.get("description") or "",
-    ]
-    return " | ".join(p for p in parts if p.strip())
-
-
-def _cosine_knn(query_vec: torch.Tensor, matrix: torch.Tensor, k: int = 10):
-    """
-    Simple cosine similarity nearest neighbors.
-    query_vec: [D]
-    matrix: [N, D]
-    """
-    if matrix.size(0) == 0:
-        return [], []
-
-    q = query_vec / query_vec.norm()
-    m = matrix / matrix.norm(dim=-1, keepdim=True)
-    sims = torch.matmul(m, q)  # [N]
-    vals, idx = torch.topk(sims, k=min(k, matrix.size(0)))
-    return idx.tolist(), vals.tolist()
-
-
-def save_state():
-    """Persist OBJECTS, EMBEDDINGS, and indices to disk."""
-    try:
-        with open(OBJECTS_PATH, "w", encoding="utf-8") as f:
-            json.dump(OBJECTS, f)
-    except Exception as e:
-        print(f"[ArtVector] Failed to save OBJECTS: {e}")
-
-    try:
-        indices_payload = {
-            "embedded_indices": EMBEDDED_INDICES,
-            "unembedded_indices": UNEMBEDDED_INDICES,
-        }
-        with open(INDICES_PATH, "w", encoding="utf-8") as f:
-            json.dump(indices_payload, f)
-    except Exception as e:
-        print(f"[ArtVector] Failed to save indices: {e}")
-
-    try:
-        if EMBEDDINGS is not None and EMBEDDINGS.size(0) > 0:
-            torch.save(EMBEDDINGS, EMBEDDINGS_PATH)
-        elif os.path.exists(EMBEDDINGS_PATH):
-            os.remove(EMBEDDINGS_PATH)
-    except Exception as e:
-        print(f"[ArtVector] Failed to save embeddings: {e}")
-
-
-def load_state():
-    """Load OBJECTS, EMBEDDINGS, and indices from disk, if present."""
-    global OBJECTS, EMBEDDINGS, EMBEDDED_INDICES, UNEMBEDDED_INDICES
-
-    # Objects
-    if os.path.exists(OBJECTS_PATH):
-        try:
-            with open(OBJECTS_PATH, "r", encoding="utf-8") as f:
-                OBJECTS = json.load(f)
-        except Exception as e:
-            print(f"[ArtVector] Failed to load OBJECTS: {e}")
-            OBJECTS = []
-
-    # Indices
-    if os.path.exists(INDICES_PATH):
-        try:
-            with open(INDICES_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            EMBEDDED_INDICES = data.get("embedded_indices", [])
-            UNEMBEDDED_INDICES = data.get("unembedded_indices", [])
-        except Exception as e:
-            print(f"[ArtVector] Failed to load indices: {e}")
-            EMBEDDED_INDICES = []
-            UNEMBEDDED_INDICES = list(range(len(OBJECTS)))
-    else:
-        EMBEDDED_INDICES = []
-        UNEMBEDDED_INDICES = list(range(len(OBJECTS)))
-
-    # Embeddings
-    if os.path.exists(EMBEDDINGS_PATH):
-        try:
-            EMBEDDINGS = torch.load(EMBEDDINGS_PATH, map_location="cpu")
-        except Exception as e:
-            print(f"[ArtVector] Failed to load embeddings: {e}")
-            EMBEDDINGS = None
-    else:
-        EMBEDDINGS = None
-
-
-# Load any existing state when the app starts
-load_state()
-
-
-# -----------------------
-# Routes
-# -----------------------
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "total_objects": len(OBJECTS),
-        "embedded": len(EMBEDDED_INDICES),
-        "remaining": len(UNEMBEDDED_INDICES),
-        "has_embeddings": EMBEDDINGS is not None and EMBEDDINGS.size(0) > 0 if EMBEDDINGS is not None else False,
-    }
-
+def build_object_text(row: dict) -> str:
+    parts = []
+    for key in ["Title", "ObjectName", "Artist", "Maker", "Culture", "Medium", "Classification", "Department"]:
+        v = row.get(key)
+        if v:
+            parts.append(str(v))
+    if not parts:
+        parts = [ " ".join(str(v) for v in row.values() if v) ]
+    return " | ".join(parts)
 
 @app.post("/upload_dataset")
-async def upload_dataset(file: UploadFile = File(...)):
-    """
-    Accept a CSV (Met Open Access style), parse it, and build in-memory objects.
-    Existing objects / embeddings are reset.
-    """
-    global OBJECTS, EMBEDDINGS, EMBEDDED_INDICES, UNEMBEDDED_INDICES
+async def upload_dataset(
+    file: UploadFile = File(...),
+    name: Optional[str] = Form(None),
+    source_type: Optional[str] = Form("museum"),
+):
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
 
-    try:
-        content = await file.read()  # This will handle ~350MB on a decently-sized machine.
-        text_stream = io.StringIO(content.decode("utf-8", errors="ignore"))
-        reader = csv.DictReader(text_stream)
-    except Exception as exc:
-        return JSONResponse(status_code=400, content={"error": f"Failed to read CSV: {exc}"})
+    content = await file.read()
+    decoded = content.decode("utf-8", errors="ignore")
+    reader = csv.DictReader(io.StringIO(decoded))
+    fields = reader.fieldnames or []
 
-    objects: List[Dict[str, Any]] = []
+    dataset_name = name or os.path.splitext(file.filename)[0]
+    dataset_id = register_dataset(dataset_name, file.filename, fields, source_type or "museum")
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    num_objects = 0
     for row in reader:
-        obj = _build_object_from_row(row)
-        if obj:
-            objects.append(obj)
+        original_id = row.get("ObjectID") or row.get("id") or str(num_objects + 1)
+        object_uid = build_object_uid(dataset_id, original_id)
+        title = row.get("Title") or row.get("ObjectName")
+        artist = row.get("Artist") or row.get("Maker")
+        image_url = row.get("ImageURL") or row.get("PrimaryImage") or row.get("Image") or None
+        has_image = 1 if image_url else 0
 
-    OBJECTS = objects
-    EMBEDDINGS = None
-    EMBEDDED_INDICES = []
-    UNEMBEDDED_INDICES = list(range(len(OBJECTS)))
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO objects (
+                object_uid, dataset_id, original_id, title, artist,
+                image_url, has_image, raw_metadata, embedding
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                object_uid,
+                dataset_id,
+                original_id,
+                title,
+                artist,
+                image_url,
+                has_image,
+                json.dumps(row),
+            ),
+        )
+        num_objects += 1
 
-    # Persist the new dataset (objects + empty index)
-    save_state()
+    cur.execute("UPDATE datasets SET num_objects = ? WHERE dataset_id = ?", (num_objects, dataset_id))
+    conn.commit()
+    conn.close()
 
     return {
-        "status": "ok",
-        "total_objects": len(OBJECTS),
+        "dataset_id": dataset_id,
+        "dataset_name": dataset_name,
+        "num_objects": num_objects,
+        "fields": fields,
     }
 
+@app.post("/process_batch")
+def process_batch(batch_size: int = 128):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) as c FROM objects WHERE embedding IS NULL"
+    )
+    remaining = cur.fetchone()["c"]
+
+    if remaining == 0:
+        conn.close()
+        return {
+            "embedded_this_batch": 0,
+            "remaining": 0,
+            "total": 0,
+            "done": True,
+        }
+
+    cur.execute(
+        """
+        SELECT id, raw_metadata, dataset_id, original_id
+        FROM objects
+        WHERE embedding IS NULL
+        LIMIT ?
+        """,
+        (batch_size,),
+    )
+    rows = cur.fetchall()
+    ids = [r["id"] for r in rows]
+    meta = [json.loads(r["raw_metadata"]) for r in rows]
+
+    texts = [build_object_text(m) for m in meta]
+    embeddings = embed_texts(texts)
+    embeddings = embeddings.cpu()
+
+    for obj_id, vec in zip(ids, embeddings):
+        vec_list = vec.tolist()
+        cur.execute(
+            "UPDATE objects SET embedding = ? WHERE id = ?",
+            (json.dumps(vec_list), obj_id),
+        )
+
+    conn.commit()
+
+    cur.execute("SELECT COUNT(*) as c FROM objects")
+    total = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) as c FROM objects WHERE embedding IS NULL")
+    remaining_after = cur.fetchone()["c"]
+    conn.close()
+
+    return {
+        "embedded_this_batch": len(ids),
+        "remaining": remaining_after,
+        "total": total,
+        "done": remaining_after == 0,
+    }
 
 @app.get("/job_status")
 def job_status():
-    total = len(OBJECTS)
-    processed = len(EMBEDDED_INDICES)
-    remaining = len(UNEMBEDDED_INDICES)
-    if total == 0:
-        status = "empty"
-    elif remaining == 0:
-        status = "done"
-    else:
-        status = "indexing"
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as c FROM objects")
+    total = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) as c FROM objects WHERE embedding IS NULL")
+    remaining = cur.fetchone()["c"]
+    embedded = total - remaining
+    conn.close()
     return {
-        "status": status,
-        "processed_count": processed,
-        "total_count": total,
+        "total": total,
+        "embedded": embedded,
         "remaining": remaining,
     }
 
-
-@app.post("/process_batch")
-def process_batch(limit: int = 128):
-    """
-    Embed a batch of UNEMBEDDED_INDICES into EMBEDDINGS.
-    This is called repeatedly (e.g. from the UI while polling job status).
-    """
-    global EMBEDDINGS, EMBEDDED_INDICES, UNEMBEDDED_INDICES
-
-    if not UNEMBEDDED_INDICES:
-        return {"processed": 0, "remaining": 0, "total_embedded": len(EMBEDDED_INDICES)}
-
-    take = UNEMBEDDED_INDICES[:limit]
-    UNEMBEDDED_INDICES = UNEMBEDDED_INDICES[limit:]
-
-    vecs = []
-    new_indices = []
-
-    for idx in take:
-        obj = OBJECTS[idx]
-        text = _build_text_for_object(obj)
-        vec_list = embed_text(text)
-        if vec_list is None:
-            continue
-        vec = torch.tensor(vec_list, dtype=torch.float32)
-        vecs.append(vec)
-        new_indices.append(idx)
-
-    if not vecs:
-        # Even if none embedded this round, persist indices state
-        save_state()
-        return {"processed": 0, "remaining": len(UNEMBEDDED_INDICES), "total_embedded": len(EMBEDDED_INDICES)}
-
-    batch_tensor = torch.stack(vecs, dim=0)  # [B, D]
-
-    if EMBEDDINGS is None:
-        EMBEDDINGS = batch_tensor
-        EMBEDDED_INDICES = new_indices
-    else:
-        EMBEDDINGS = torch.cat([EMBEDDINGS, batch_tensor], dim=0)
-        EMBEDDED_INDICES.extend(new_indices)
-
-    # Persist updated embeddings and indices
-    save_state()
-
-    return {
-        "processed": len(new_indices),
-        "remaining": len(UNEMBEDDED_INDICES),
-        "total_embedded": len(EMBEDDED_INDICES),
-    }
-
-
-@app.get("/search_text")
-def search_text(q: str = Query(..., description="Text query"), limit: int = 10):
-    """
-    Search over whatever subset of objects has been embedded so far.
-    """
-    if EMBEDDINGS is None or EMBEDDINGS.size(0) == 0:
-        return []
-
-    vec_list = embed_text(q)
-    if vec_list is None:
-        return []
-
-    query_vec = torch.tensor(vec_list, dtype=torch.float32)
-    idxs, _ = _cosine_knn(query_vec, EMBEDDINGS, k=limit)
-
-    # idxs are positions in EMBEDDINGS, map back via EMBEDDED_INDICES to OBJECTS
-    results = []
-    for pos in idxs:
-        obj_idx = EMBEDDED_INDICES[pos]
-        if 0 <= obj_idx < len(OBJECTS):
-            obj = OBJECTS[obj_idx]
-            results.append(
-                {
-                    "id": obj.get("id"),
-                    "title": obj.get("title"),
-                    "artist_display": obj.get("artist_display"),
-                    "medium": obj.get("medium"),
-                    "department": obj.get("department"),
-                    "image_url": obj.get("image_url"),
-                    "object_url": obj.get("object_url"),
-                }
+@app.get("/all_datasets", response_model=List[DatasetOut])
+def all_datasets():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM datasets ORDER BY created_at DESC")
+    rows = cur.fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        out.append(
+            DatasetOut(
+                dataset_id=r["dataset_id"],
+                name=r["name"],
+                source_type=r["source_type"],
+                original_filename=r["original_filename"],
+                created_at=r["created_at"],
+                metadata_fields=json.loads(r["metadata_fields"] or "[]"),
+                num_objects=r["num_objects"] or 0,
             )
+        )
+    return out
+
+@app.get("/all_objects", response_model=List[ObjectOut])
+def all_objects(dataset_id: Optional[str] = None, limit: int = 500):
+    conn = get_db()
+    cur = conn.cursor()
+    if dataset_id:
+        cur.execute(
+            """
+            SELECT * FROM objects
+            WHERE dataset_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (dataset_id, limit),
+        )
+    else:
+        cur.execute(
+            "SELECT * FROM objects ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+    rows = cur.fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        out.append(
+            ObjectOut(
+                object_uid=r["object_uid"],
+                dataset_id=r["dataset_id"],
+                original_id=r["original_id"],
+                title=r["title"],
+                artist=r["artist"],
+                image_url=r["image_url"],
+                has_image=bool(r["has_image"]),
+                raw_metadata=json.loads(r["raw_metadata"] or "{}"),
+            )
+        )
+    return out
+
+@app.get("/search_text", response_model=List[SearchResult])
+def search_text(q: str, limit: int = 20, dataset_id: Optional[str] = None, images_only: bool = False):
+    if not q:
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    base_query = "SELECT * FROM objects WHERE embedding IS NOT NULL"
+    params = []
+    if dataset_id:
+        base_query += " AND dataset_id = ?"
+        params.append(dataset_id)
+    if images_only:
+        base_query += " AND has_image = 1"
+
+    cur.execute(base_query, params)
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        return []
+
+    obj_vecs = []
+    objs = []
+    for r in rows:
+        emb = json.loads(r["embedding"])
+        obj_vecs.append(emb)
+        objs.append(r)
+
+    obj_tensor = torch.tensor(obj_vecs, dtype=torch.float32)
+    query_emb = embed_texts([q]).cpu()[0]
+
+    scores = torch.matmul(obj_tensor, query_emb)
+    scores_vals = scores.numpy()
+
+    indices = scores.argsort(descending=True)[:limit].tolist()
+
+    results: List[SearchResult] = []
+    for idx in indices:
+        r = objs[idx]
+        score = float(scores_vals[idx])
+        results.append(
+            SearchResult(
+                score=score,
+                obj=ObjectOut(
+                    object_uid=r["object_uid"],
+                    dataset_id=r["dataset_id"],
+                    original_id=r["original_id"],
+                    title=r["title"],
+                    artist=r["artist"],
+                    image_url=r["image_url"],
+                    has_image=bool(r["has_image"]),
+                    raw_metadata=json.loads(r["raw_metadata"] or "{}"),
+                ),
+            )
+        )
+
     return results

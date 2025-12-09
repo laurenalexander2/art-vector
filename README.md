@@ -1,171 +1,202 @@
-📌 README.md — ArtVector
-(Semantic Retrieval Engine for Cultural Data)
+# ArtVector (Persistent Edition)
 
-1. Project Overview
-ArtVector is a semantic retrieval engine for museum and cultural heritage datasets.
-It ingests large metadata exports (e.g., The Metropolitan Museum of Art Open Access CSV),
-converts objects into latent embedding space, and enables meaning-based search
-without keyword matching.
-This system is intended as:
-✔ a research/prototype platform
-✔ an institutional discovery layer
-✔ a foundation for future vector database integrations
-✔ a demonstrator for semantic search over cultural objects
+Semantic search for museum and cultural collections — with **SQLite-backed persistence**, dataset provenance, and a multi-page Streamlit UI.
 
-2. System Function
-ArtVector performs:
-Dataset ingestion
-→ Extracts usable objects and fields
-Representation learning
-→ Embeds text metadata using SentenceTransformer models
-Indexing and batching
-→ Builds progressive embedding matrix in memory
-Semantic evaluation & retrieval
-→ Converts queries into embedding space
-→ Computes cosine similarity to items
-→ Returns top-K meaning neighbors
+## What This App Does
 
-3. Why This Exists
-Museums store millions of objects but:
-indexing is literal
-subject terms are inconsistent
-keywords don’t capture artistic meaning
-cross-collection similarity is invisible
-ArtVector produces latent search:
-“floral abstract etching”
-“mexican surrealist woodcut”
-“female portrait lithograph 1950s”
-“bronze ritual vessel”
-… return objects that fit meaningfully, not literally.
+- Ingests large collection CSVs (e.g. Met Open Access export)
+- Registers each upload as a **dataset** with:
+  - dataset ID
+  - human-readable name
+  - source type (e.g. museum, archive)
+  - original filename
+  - metadata fields
+- Stores each object in **SQLite**, linked to its dataset and original ID
+- Generates **semantic embeddings** using `sentence-transformers/all-MiniLM-L6-v2`
+- Persists embeddings in the database so work is **not lost on restart**
+- Provides:
+  - 🔍 **Semantic Search** page
+  - 🗂 **Dataset Overview** page
+  - 📚 **Object Index** page
+  - 📂 **Upload & Index** page with embedding progress
 
-4. Architecture
-frontend/  (Streamlit UI)
-backend/   (FastAPI embedding + retrieval engine)
-docker     (Isolation + reproducibility)
-Components:
-4.1 Backend (FastAPI)
-Dataset loader
-Latent embedding engine
-Cosine similarity / ANN search
-Progressive batching system
-4.2 Embedding engine
-SentenceTransformer: all-MiniLM-L6-v2
-Normalized 384-dim vector output
-4.3 In-memory vector store
-Stores:
-OBJECTS                → list of dicts
-EMBEDDINGS             → torch tensor [N, D]
-EMBEDDED_INDICES       → mapping embeddings → objects
-UNEMBEDDED_INDICES     → work queue
-4.4 Frontend
-Dataset upload
-Embedding progress polling
-Semantic text search UI
-Image preview + metadata readout
+## Tech Stack
 
-5. Execution Flow
-Upload
-CSV → parse rows → build object list → reset embedding state
-Indexing
-Loop:
-take N pending objects →
-build text →
-embedding →
-normalize →
-append to tensor →
-update index →
-repeat until done
-Search
-text query →
-embed →
-cosine similarity →
-return best neighbors
+- **Backend:** FastAPI, SQLite, Torch, SentenceTransformers
+- **Frontend:** Streamlit
+- **Container:** Docker + Docker Compose
 
-6. Technologies Used
-FastAPI — backend API framework
-Torch — cosine similarity + tensor operations
-SentenceTransformers — semantic encoding
-Streamlit — UI layer
-Docker Compose — two-service orchestration
+## Project Layout
 
-7. Installation
-Requirements
-Docker Desktop (Mac / Windows / Linux)
-Internet (first run downloads SentenceTransformer)
-Run
+```bash
+artvector_app/
+├── backend/
+│   ├── app.py           # FastAPI app + SQLite persistence
+│   └── embedding.py     # SentenceTransformer wrapper
+├── frontend/
+│   └── ui_app.py        # Multi-page Streamlit UI
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+└── README.md
+```
+
+## Running the App
+
+You need:
+
+- Docker Desktop (Mac / Windows / Linux)
+- Internet on first run (to download the embedding model)
+
+From the `artvector_app` directory:
+
+```bash
 docker compose up --build
-Visit UI:
-http://localhost:8501
+```
 
-8. Usage
-1. Upload a Met-style Open Access CSV
-→ UI reads dataset → backend extracts objects
-2. Start indexing
-Embeds objects in progressive batches
-UI polls /job_status
-Progress bar updates
-3. Semantic search
-Enter queries like:
-surrealist female portrait
-religious woodcut print
-bronze ritual vessel
-abstract lithograph 1950s
-Returns meaningfully related objects (not literal matches).
+Then visit:
 
-9. API Endpoints (Backend)
-/upload_dataset
-POST CSV → ingest objects
-/process_batch
-Run N embeddings → append to tensor
-/job_status
-Return process state
-/search_text?q=...&limit=N
-Return semantic neighbors
+- UI: http://localhost:8501
+- API (optional): http://localhost:8000/docs
 
-10. Embedding Model Notes
-Model:
-sentence-transformers/all-MiniLM-L6-v2
-384-dim dense vector
-cosine-normalized output
-Properties:
-good CPU inference speed
-robust for metadata short text
-meaning separation in cultural terminology
-Swappable — see section 13.
+A Docker volume named `artvector_data` stores:
 
-11. Performance Notes
-Handles 300–500k objects on a modern MacBook / cloud VM
-Embedding cost scales linearly
-Fast search via vector normalization and top-k similarity
-Future work:
-approximate nearest neighbor index
-persistent vector store
+- `artvector.db` — SQLite database with datasets, objects, and embeddings.
 
-12. Limitations
-This version is in-memory only, meaning:
-❌ embeddings disappear on restart
-❌ not multi-user persistent
-❌ not optimized for ANN querying
-These are intentional — the app is an engine prototype, not the enterprise artifact.
+## Usage Flow
 
-13. Model Substitution Guide
-To change embeddings:
-Edit:
-backend/embedding.py
-Swap:
-"sentence-transformers/all-MiniLM-L6-v2"
-for:
-multi-qa-MiniLM-L6-cos-v1 (ranking optimized)
-all-mpnet-base-v2 (higher semantic richness)
-CLIP text encoder for multimodal future work
+### 1. Upload a Dataset
 
-14. Roadmap (Turning Prototype → Product)
-Phase 1 — Add persistence (pgVector, Qdrant, or Vespa)
-Phase 2 — Add enrichment UI (taxonomy filling, clustering, similarity sets)
-Phase 3 — Add authority vocabulary linking (ULAN, AAT, VIAF)
-Phase 4 — Multimodal support (image embeddings + alignment)
-Phase 5 — Access control, curator workspace, annotation layer
-Phase 6 — Packaging for institutional deployment
+Go to **Upload & Index** in the sidebar.
 
-15. Concept Summary
-ArtVector is an indexing engine that transforms cultural metadata into latent space, enabling institutional search and discovery by meaning rather than keywords.
+- Upload a CSV (Met-style Open Access exports work well)
+- Optionally provide:
+  - Dataset name
+  - Source type (e.g. museum, archive, gallery)
+- The backend:
+  - Registers a dataset row in SQLite
+  - Streams the CSV
+  - Inserts objects linked to that dataset
+  - Marks them as **unembedded** initially
+
+### 2. Embed Objects
+
+On the same page:
+
+- Click **Run one embedding batch** to embed a chunk
+- Or **Run batches until done** to process the entire queue
+
+Under the hood:
+
+- `/process_batch`:
+  - Selects N objects with `embedding IS NULL`
+  - Builds text from fields like Title, Artist, Medium, Culture
+  - Encodes with `all-MiniLM-L6-v2` (cosine-normalized)
+  - Stores the vector as JSON in SQLite
+
+You can check progress via **Refresh status**, which calls `/job_status`.
+
+### 3. Explore Datasets
+
+On the **Datasets** page:
+
+- See all datasets with:
+  - dataset ID
+  - name
+  - source type
+  - original filename
+  - created-at timestamp
+  - number of objects
+  - metadata field list
+
+Each upload is a **source** that is tracked forever.
+
+### 4. Browse Objects
+
+On the **Object Index** page:
+
+- Filter by dataset or view across all
+- Configure how many objects to load (up to 2000)
+- See:
+  - object UID (`{dataset_id}__{original_id}`)
+  - dataset
+  - artist
+  - title
+  - image presence
+
+You can also expand a section to see **raw metadata** for sample objects.
+
+### 5. Run Semantic Search
+
+On the **Semantic Search** page:
+
+- Enter a meaning-based text query:
+  - `surrealist female portrait`
+  - `bronze ritual vessel`
+  - `abstract lithograph 1950s`
+- Optionally:
+  - Limit to a specific dataset
+  - Require objects with images only
+- The backend:
+  - Embeds the query
+  - Loads embedded objects (optionally filtered)
+  - Computes cosine similarity in PyTorch
+  - Returns top-k neighbors with scores and metadata
+
+If object rows include image URLs, the UI will show **inline thumbnails**.
+
+## Schema
+
+### datasets
+
+- `id` (INTEGER, PK)
+- `dataset_id` (TEXT, unique) – internal slug
+- `name` (TEXT)
+- `source_type` (TEXT)
+- `original_filename` (TEXT)
+- `created_at` (TEXT, ISO)
+- `metadata_fields` (TEXT, JSON array)
+- `num_objects` (INTEGER)
+
+### objects
+
+- `id` (INTEGER, PK)
+- `object_uid` (TEXT, unique) – `{dataset_id}__{original_id}`
+- `dataset_id` (TEXT, FK → datasets.dataset_id)
+- `original_id` (TEXT) – museum/local object ID
+- `title` (TEXT)
+- `artist` (TEXT)
+- `image_url` (TEXT)
+- `has_image` (INTEGER, 0/1)
+- `raw_metadata` (TEXT, JSON)
+- `embedding` (TEXT, JSON array of floats, nullable)
+
+Objects are always linked back to their dataset and keep a full copy of the original CSV row.
+
+## Notes & Limitations
+
+- This is a **prototype engine**, not a production ANN service.
+- For large collections (>200k objects), you may want to:
+  - Move embeddings into a dedicated vector DB (pgVector, Qdrant, Vespa)
+  - Use ANN indexing instead of in-memory cosine over all rows.
+- SQLite is used here to give you:
+  - Persistence
+  - Easy inspection
+  - Path to migrate later
+
+## Extending This
+
+Some natural next steps:
+
+- Add image embeddings & multimodal search
+- Add curator workspaces (saved sets, comparisons)
+- Add object-level linking to authority vocabularies (ULAN, AAT, VIAF)
+- Export search results as CSV for cataloging workflows
+
+---
+
+If you want to integrate with an existing museum system, you can:
+
+- Map `original_id` to local object IDs
+- Use `dataset_id` to represent specific exports or collection segments
+- Keep the SQLite DB as a cache in front of an institutional system of record

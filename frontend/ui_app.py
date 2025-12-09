@@ -1,205 +1,220 @@
 import os
+import json
 import time
+from typing import List, Dict, Any
 
+import pandas as pd
 import requests
 import streamlit as st
 
+
+def inject_css():
+    import streamlit as st
+    st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500&display=swap');
+    :root { --serif: "Times New Roman", serif; --sans: "Inter", sans-serif; --idle:#bfbfbf; --hover:#fff; }
+    html, body { background:#000 !important; color:#fff !important; font-family:var(--sans); }
+    section[data-testid="stSidebar"] { background:#000 !important; border-right:1px solid #222; padding-top:40px !important; }
+    h1,h2,h3 { font-family:var(--serif); font-weight:400 !important; }
+    .stButton button { background:#fff !important; color:#000 !important; border-radius:4px; padding:10px 24px; }
+    .result-card { padding:20px; background:#111; border:1px solid #222; border-radius:6px; margin-bottom:20px; }
+    .result-card-title { font-family:var(--serif); font-size:26px; margin-bottom:12px; }
+    </style>
+    """, unsafe_allow_html=True)
+inject_css()
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
-st.set_page_config(page_title="ArtVector – Semantic Museum Search", layout="wide")
-st.title("ArtVector – Semantic Search over Museum Collections")
+st.set_page_config(
+    page_title="ArtVector – Semantic Search for Collections",
+    layout="wide",
+)
 
-tab_upload, tab_search = st.tabs(["Upload & Index", "Search"])
+PAGES = ["Upload & Index", "Semantic Search", "Datasets", "Object Index"]
 
+st.sidebar.title("ArtVector")
+page = st.sidebar.radio("Navigation", PAGES)
 
-def format_eta(seconds: float) -> str:
-    if seconds <= 0 or seconds != seconds:  # NaN or negative
-        return "estimating..."
-    m, s = divmod(int(seconds), 60)
-    if m == 0:
-        return f"~{s}s remaining"
-    if m < 60:
-        return f"~{m}m {s}s remaining"
-    h, m = divmod(m, 60)
-    return f"~{h}h {m}m remaining"
+def api_get(path: str, **params):
+    url = f"{API_BASE}{path}"
+    resp = requests.get(url, params=params)
+    resp.raise_for_status()
+    return resp.json()
 
+def api_post(path: str, files=None, data=None, json_body=None, **params):
+    url = f"{API_BASE}{path}"
+    if json_body is not None:
+        resp = requests.post(url, params=params, json=json_body)
+    else:
+        resp = requests.post(url, params=params, files=files, data=data)
+    resp.raise_for_status()
+    return resp.json()
 
-with tab_upload:
-    st.subheader("Upload Met Open Access CSV (or similar)")
+@st.cache_data(ttl=10)
+def load_datasets() -> List[Dict[str, Any]]:
+    return api_get("/all_datasets")
 
-    # Show current backend health
-    try:
-        health = requests.get(f"{API_BASE}/health", timeout=10).json()
-        st.caption(
-            f"Backend: {health.get('status')} | "
-            f"Objects: {health.get('total_objects', 0)} | "
-            f"Embedded: {health.get('embedded', 0)} | "
-            f"Remaining: {health.get('remaining', 0)}"
-        )
-    except Exception as e:
-        st.error(f"Could not reach backend: {e}")
-        health = None
+def render_upload_page():
+    st.title("📂 Upload & Index Dataset")
 
-    csv_file = st.file_uploader(
-        "Drag and drop a CSV file here", type=["csv"], key="csv_uploader"
+    st.markdown(
+        """Upload a **museum or collection CSV** (Met-style exports work great).  
+        The backend will ingest rows, register a dataset, and queue objects for embedding.
+        """
     )
 
-    if csv_file is not None and st.button("Upload and initialize dataset", type="primary"):
-        files = {"file": (csv_file.name, csv_file.getvalue(), "text/csv")}
-        with st.spinner("Uploading and parsing CSV on the server..."):
-            try:
-                resp = requests.post(f"{API_BASE}/upload_dataset", files=files, timeout=600)
-            except Exception as e:
-                st.error(f"Upload failed: {e}")
-                resp = None
+    with st.form("upload_form"):
+        file = st.file_uploader("Upload CSV file", type=["csv"])
+        dataset_name = st.text_input("Dataset name (optional)")
+        source_type = st.text_input("Source type", value="museum")
+        submitted = st.form_submit_button("Upload")
 
-        if resp is None:
-            pass
-        elif resp.status_code != 200:
-            st.error("Upload failed:")
-            st.code(resp.text)
-        else:
-            data = resp.json()
-            total = data.get("total_objects", 0)
-            st.success(f"Dataset loaded with {total} objects. You can now start indexing.")
+    if submitted and file is not None:
+        with st.spinner("Uploading and ingesting dataset…"):
+            files = {"file": (file.name, file.getvalue(), "text/csv")}
+            data = {
+                "name": dataset_name,
+                "source_type": source_type,
+            }
+            res = api_post("/upload_dataset", files=files, data=data)
+        st.success(f"Dataset uploaded: `{res['dataset_id']}` with {res['num_objects']} objects.")
+        st.json(res)
 
-    st.markdown("### Indexing status")
+    st.markdown("### 🔄 Embedding Progress")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Run one embedding batch"):
+            with st.spinner("Processing batch…"):
+                res = api_post("/process_batch")
+            st.write(res)
 
-    status_placeholder = st.empty()
-    progress_bar = st.empty()
-    eta_placeholder = st.empty()
+    with col2:
+        if st.button("Run batches until done (may take a while)"):
+            progress = st.empty()
+            status_box = st.empty()
+            while True:
+                res = api_post("/process_batch")
+                status_box.write(res)
+                if res.get("done") or res.get("embedded_this_batch", 0) == 0:
+                    break
+                progress.write(f"Embedded this batch: {res['embedded_this_batch']}, remaining: {res['remaining']}")
+                time.sleep(0.5)
+            st.success("Embedding complete or queue exhausted.")
 
-    if st.button("Start / continue indexing", type="secondary"):
-        start_time = time.time()
-        last_processed = 0
-        last_time = start_time
+    st.markdown("### 📊 Current Job Status")
+    if st.button("Refresh status"):
+        status = api_get("/job_status")
+        st.write(status)
 
-        while True:
-            # Ask API to process a batch
-            try:
-                _ = requests.post(
-                    f"{API_BASE}/process_batch", params={"limit": 128}, timeout=600
-                )
-            except Exception as e:
-                status_placeholder.error(f"Error calling process_batch: {e}")
-                break
+def render_search_page():
+    st.title("🔍 Semantic Search")
 
-            # Get status
-            try:
-                status_resp = requests.get(f"{API_BASE}/job_status", timeout=60)
-            except Exception as e:
-                status_placeholder.error(f"Error getting job_status: {e}")
-                break
+    datasets = load_datasets()
+    dataset_options = ["All datasets"] + [d["dataset_id"] for d in datasets]
+    selected_dataset = st.selectbox("Limit to dataset", dataset_options)
+    dataset_id = None if selected_dataset == "All datasets" else selected_dataset
 
-            if status_resp.status_code != 200:
-                status_placeholder.error("job_status failed:")
-                status_placeholder.code(status_resp.text)
-                break
+    images_only = st.checkbox("Only show objects with images", value=False)
 
-            sdata = status_resp.json()
-            status = sdata.get("status")
-            processed = sdata.get("processed_count", 0)
-            total = sdata.get("total_count", 0)
-            remaining = sdata.get("remaining", 0)
+    query = st.text_input("Enter a meaning-based query", value="surrealist female portrait")
+    k = st.slider("Results to show", 5, 50, 15)
 
-            pct = int(processed / total * 100) if total > 0 else 0
-
-            # ETA calculation
-            now = time.time()
-            elapsed = now - start_time
-            if processed > 0 and total > 0:
-                rate = processed / max(elapsed, 1e-6)  # objects per second
-                est_total_time = total / rate
-                eta_seconds = est_total_time - elapsed
-            else:
-                eta_seconds = -1
-
-            status_placeholder.info(
-                f"Status: {status} | Embedded: {processed} / {total} | Remaining: {remaining}"
+    if st.button("Search") and query:
+        with st.spinner("Embedding query and searching…"):
+            res = api_get(
+                "/search_text",
+                q=query,
+                limit=k,
+                dataset_id=dataset_id,
+                images_only=images_only,
             )
-            progress_bar.progress(min(pct, 100))
-            eta_placeholder.caption(f"ETA: {format_eta(eta_seconds)}")
 
-            if status == "done" or remaining == 0:
-                status_placeholder.success(
-                    f"Indexing complete! Embedded {processed} / {total} objects."
-                )
-                eta_placeholder.caption("ETA: done")
-                break
+        if not res:
+            st.warning("No results yet. Make sure you've embedded at least some objects.")
+            return
 
-            time.sleep(1)
+        for r in res:
+            obj = r["obj"]
+            score = r["score"]
+            with st.expander(f"{obj.get('title') or '[Untitled]'} — score {score:.3f}"):
+                meta = obj["raw_metadata"]
+                left, right = st.columns([2, 1])
+                with left:
+                    st.write(f"**Dataset:** `{obj['dataset_id']}`")
+                    st.write(f"**Artist:** {obj.get('artist')}")
+                    st.write(f"**Original ID:** {obj.get('original_id')}")
+                    st.json(meta)
+                with right:
+                    if obj.get("image_url"):
+                        st.image(obj["image_url"], caption=obj.get("title") or "Image")
 
+def render_datasets_page():
+    st.title("🗂 Datasets")
 
-with tab_search:
-    st.subheader("Search embedded artworks (semantic text search)")
+    datasets = load_datasets()
+    if not datasets:
+        st.info("No datasets yet. Upload one from the **Upload & Index** page.")
+        return
 
-    query = st.text_input("Query", "surrealist self-portrait")
-    limit = st.slider("Max results", 5, 50, 15)
+    df = pd.DataFrame(datasets)
+    st.dataframe(df)
 
-    if st.button("Search", type="primary"):
-        if not query.strip():
-            st.warning("Please enter a query.")
-        else:
-            # Check if any embeddings exist
-            try:
-                health = requests.get(f"{API_BASE}/health", timeout=10).json()
-            except Exception as e:
-                st.error(f"Could not reach backend: {e}")
-                health = None
+    st.markdown("#### Dataset details")
+    for d in datasets:
+        with st.expander(f"{d.get('name') or d['dataset_id']}"):
+            st.write(f"**ID:** `{d['dataset_id']}`")
+            st.write(f"**Source type:** {d.get('source_type')}")
+            st.write(f"**Original file:** {d.get('original_filename')}")
+            st.write(f"**Created at:** {d.get('created_at')}")
+            st.write(f"**Objects:** {d.get('num_objects')}")
+            st.write("**Metadata fields:**")
+            st.code(", ".join(d.get("metadata_fields", [])))
 
-            if not health or not health.get("has_embeddings"):
-                st.warning(
-                    "No embeddings found yet. "
-                    "Please upload a dataset and complete (or at least start) indexing."
-                )
-            else:
-                with st.spinner("Searching..."):
-                    try:
-                        resp = requests.get(
-                            f"{API_BASE}/search_text",
-                            params={"q": query, "limit": limit},
-                            timeout=120,
-                        )
-                    except Exception as e:
-                        st.error(f"Search request failed: {e}")
-                        resp = None
+def render_object_index_page():
+    st.title("📚 Object Index")
 
-                if resp is None:
-                    pass
-                elif resp.status_code != 200:
-                    st.error("Search failed:")
-                    st.code(resp.text)
-                else:
-                    try:
-                        results = resp.json()
-                    except Exception:
-                        st.error("Backend returned a non-JSON response.")
-                        st.code(resp.text)
-                        results = []
+    datasets = load_datasets()
+    dataset_options = ["All datasets"] + [d["dataset_id"] for d in datasets]
+    selected_dataset = st.selectbox("Filter by dataset", dataset_options)
+    dataset_id = None if selected_dataset == "All datasets" else selected_dataset
 
-                    st.markdown(f"### {len(results)} results")
+    limit = st.slider("Max objects to load", 100, 2000, 500, step=100)
 
-                    if not results:
-                        st.info("No results for this query (index exists, but no close matches).")
-                    else:
-                        for r in results:
-                            cols = st.columns([1, 3])
-                            with cols[0]:
-                                if r.get("image_url"):
-                                    st.image(r["image_url"])
-                            with cols[1]:
-                                title = r.get("title") or "Untitled"
-                                artist = r.get("artist_display") or "Unknown artist"
-                                medium = r.get("medium") or ""
-                                dept = r.get("department") or ""
+    with st.spinner("Loading objects…"):
+        objs = api_get("/all_objects", dataset_id=dataset_id, limit=limit)
 
-                                st.markdown(f"**{title}**")
-                                st.markdown(artist)
-                                if medium:
-                                    st.markdown(medium)
-                                if dept:
-                                    st.caption(dept)
-                                if r.get("object_url"):
-                                    st.markdown(f"[View on museum site]({r['object_url']})")
+    if not objs:
+        st.info("No objects found. Have you uploaded a dataset?")
+        return
 
-                            st.markdown("---")
+    records = []
+    for o in objs:
+        records.append(
+            {
+                "object_uid": o["object_uid"],
+                "dataset_id": o["dataset_id"],
+                "original_id": o.get("original_id"),
+                "title": o.get("title"),
+                "artist": o.get("artist"),
+                "has_image": o.get("has_image"),
+                "image_url": o.get("image_url"),
+            }
+        )
+
+    df = pd.DataFrame(records)
+    st.dataframe(df)
+
+    st.markdown("#### Sample raw metadata")
+    with st.expander("Show raw metadata for first 5 objects"):
+        for o in objs[:5]:
+            st.write(f"**{o.get('title') or '[Untitled]'}** — `{o['object_uid']}`")
+            st.json(o["raw_metadata"])
+
+if page == "Upload & Index":
+    render_upload_page()
+elif page == "Semantic Search":
+    render_search_page()
+elif page == "Datasets":
+    render_datasets_page()
+elif page == "Object Index":
+    render_object_index_page()

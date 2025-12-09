@@ -3,19 +3,23 @@ version: "3.9"
 services:
   api:
     build: .
-    container_name: art_vector_api
+    container_name: artvector_api
     command: >
       uvicorn backend.app:app
       --host 0.0.0.0
       --port 8000
+      --reload
     ports:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
+      - DATA_PATH=/data
+    volumes:
+      - artvector_data:/data
 
   ui:
     build: .
-    container_name: art_vector_ui
+    container_name: artvector_ui
     command: >
       streamlit run frontend/ui_app.py
       --server.port=8501
@@ -27,3 +31,6 @@ services:
       - STREAMLIT_SERVER_MAX_UPLOAD_SIZE=1000
     depends_on:
       - api
+
+volumes:
+  artvector_data:

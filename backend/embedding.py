@@ -1,13 +1,15 @@
+import torch
 from sentence_transformers import SentenceTransformer
+from functools import lru_cache
 
-_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-def embed_text(text: str):
-    text = (text or "").strip()
-    if not text:
-        return None
-    try:
-        emb = _model.encode([text], normalize_embeddings=True)[0]
-        return emb.tolist()
-    except Exception:
-        return None
+@lru_cache(maxsize=1)
+def get_model():
+    return SentenceTransformer(MODEL_NAME)
+
+def embed_texts(texts):
+    model = get_model()
+    with torch.no_grad():
+        emb = model.encode(texts, convert_to_tensor=True, normalize_embeddings=True)
+    return emb
