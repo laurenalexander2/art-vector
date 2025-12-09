@@ -10,11 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt .
 
-# Install CPU-only Torch first
+# Install CPU Torch first
 RUN pip install --no-cache-dir torch==2.2.0+cpu \
     -f https://download.pytorch.org/whl/cpu/torch_stable.html
 
-# Install the rest of the dependencies
+# Install rest of deps
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download MiniLM
@@ -29,7 +29,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy Python install from builder
+# Copy Python packages
 COPY --from=builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
 COPY --from=builder /usr/local/bin /usr/local/bin
 
@@ -44,5 +44,4 @@ ENV HF_HOME=/app/.hf_cache
 
 EXPOSE 8000 8501
 
-# Start both backend + frontend
 CMD ["./start.sh"]
