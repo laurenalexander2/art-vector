@@ -10,11 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt .
 
-# Replace torch with CPU-only wheel (MUCH smaller)
-RUN sed -i "s/torch/torch==2.2.0+cpu -f https:\/\/download.pytorch.org\/whl\/cpu\/torch_stable.html/" requirements.txt
+# Install CPU-only Torch **first**
+RUN pip install --no-cache-dir torch==2.2.0+cpu \
+    -f https://download.pytorch.org/whl/cpu/torch_stable.html
 
-# Install dependencies without caching
+# THEN install everything else
 RUN pip install --no-cache-dir -r requirements.txt
+
 
 # Pre-download small model only (MiniLM)
 RUN python3 - <<EOF
