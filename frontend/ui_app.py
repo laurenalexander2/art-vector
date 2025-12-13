@@ -7,54 +7,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # ============================================================
-# Met restricted image resolver (optimistic IIIF)
-# ============================================================
-
-@st.cache_data(ttl=3600)
-def resolve_restricted_image(object_id: str) -> str | None:
-    if not object_id:
-        return None
-    return f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{object_id}/restricted"
-
-
-# ============================================================
-# Styling
-# ============================================================
-
-def inject_css():
-    st.markdown(
-        """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500&display=swap');
-
-:root {
-    --serif: "Times New Roman", serif;
-    --sans: "Inter", sans-serif;
-}
-
-html, body, [class^="css"] {
-    background:#000 !important;
-    color:#fff !important;
-    font-family:var(--sans);
-}
-
-section[data-testid="stSidebar"] {
-    background:#000 !important;
-    border-right:1px solid #222;
-}
-
-h1, h2, h3 {
-    font-family:var(--serif);
-    font-weight:400 !important;
-}
-</style>
-""",
-        unsafe_allow_html=True,
-    )
-
-inject_css()
-
-# ============================================================
 # Config
 # ============================================================
 
@@ -71,6 +23,16 @@ st.sidebar.title("ArtVector")
 page = st.sidebar.radio("Navigation", PAGES)
 
 # ============================================================
+# Met restricted image resolver (optimistic, correct)
+# ============================================================
+
+@st.cache_data(ttl=3600)
+def resolve_restricted_image(object_id: str) -> str | None:
+    if not object_id:
+        return None
+    return f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{object_id}/restricted"
+
+# ============================================================
 # API helpers
 # ============================================================
 
@@ -80,16 +42,11 @@ def api_get(path: str, **params):
     r.raise_for_status()
     return r.json()
 
-
-def api_post(path: str, files=None, data=None, json_body=None):
+def api_post(path: str, files=None, data=None):
     url = f"{API_BASE}{path}"
-    if json_body is not None:
-        r = requests.post(url, json=json_body)
-    else:
-        r = requests.post(url, files=files, data=data)
+    r = requests.post(url, files=files, data=data)
     r.raise_for_status()
     return r.json()
-
 
 @st.cache_data(ttl=10)
 def load_datasets() -> List[Dict[str, Any]]:
@@ -119,70 +76,71 @@ def render_upload_page():
         )
 
 # ============================================================
-# Semantic Search Page (CARD GRID)
+# Semantic Search Page (CORRECT + PRELOADED)
 # ============================================================
 
 def render_search_page():
-    def render_search_page():
-        st.title("Semantic Search")
-        
-        datasets = load_datasets()
-        dataset_options = ["All datasets"] + [d["dataset_id"] for d in datasets]
-        selected = st.selectbox("Limit search to dataset", dataset_options)
-        dataset_id = None if selected == "All datasets" else selected
-        
-        images_only = st.checkbox("Only show objects with images", value=False)
-        
-        # Pre-loaded query
-        default_query = "artworks that depict cosmic awe"
-        
-        # Input field with the default query
-        query = st.text_input("Enter a meaning-based query", value=default_query)
-        
-        k = st.slider("Results to show", 6, 48, 18)
-        
-        # Automatically trigger the search on page load
-        if st.button("Search") or query == default_query:
-            with st.spinner("Searching…"):
-                res = api_get(
-                    "/search_text",
-                    q=query,
-                    limit=k,
-                    dataset_id=dataset_id,
-                )
-            
-            if not res:
-                st.warning("No results found.")
-                return
+    st.title("Semantic Search")
 
-        cards = []
-        rendered = 0
+    datasets = load_datasets()
+    dataset_options = ["All datasets"] + [d["dataset_id"] for d in datasets]
+    selected = st.selectbox("Limit search to dataset", dataset_options)
+    dataset_id = None if selected == "All datasets" else selected
 
-        for r in res:
-            obj = r["obj"]
+    images_only = st.checkbox("Only show objects with images", value=False)
 
-            object_id = obj.get("original_id")
-            image_url = obj.get("image_url") or resolve_restricted_image(object_id)
+    # Preloaded query (runs automatically)
+    query = st.text_input(
+        "Enter a meaning-based query",
+        value="artworks that depict cosmic awe",
+    )
 
-            if images_only and not image_url:
-                continue
+    k = st.slider("Results to show", 6, 48, 18)
 
-            rendered += 1
+    if not query:
+        return
 
-            title = obj.get("title") or "Untitled"
-            artist = obj.get("artist") or "Unknown artist"
-            date = obj.get("year") or obj.get("date") or ""
-            medium = obj.get("medium") or ""
-            place = obj.get("place") or obj.get("culture") or ""
+    with st.spinner("Searching…"):
+        res = api_get(
+            "/search_text",
+            q=query,
+            limit=k,
+            dataset_id=dataset_id,
+        )
 
-            met_link = (
-                f"https://www.metmuseum.org/art/collection/search/{object_id}"
-                if object_id
-                else None
-            )
+    if not res:
+        st.warning("No results found.")
+        return
 
-            cards.append(
-                f"""
+    cards = []
+    rendered = 0
+
+    for r in res:
+        obj = r["obj"]
+
+        # AUTHORITATIVE SOURCE
+        meta = obj.get("raw_metadata")
+        if not meta:
+            continue  # correctness: do not guess
+
+        title = meta.get("Title") or "Untitled"
+        artist = meta.get("Artist Display Name") or "Unknown artist"
+        date = meta.get("Object Date") or ""
+        medium = meta.get("Medium") or ""
+        place = meta.get("Culture") or meta.get("Country") or ""
+
+        object_id = meta.get("Object ID")
+        met_link = meta.get("Link Resource")
+
+        image_url = resolve_restricted_image(object_id)
+
+        if images_only and not image_url:
+            continue
+
+        rendered += 1
+
+        cards.append(
+            f"""
 <div class="result-card">
   <div class="result-image">
     {"<img src='" + image_url + "' />" if image_url else ""}
@@ -195,57 +153,36 @@ def render_search_page():
       {medium}<br>
       {place}
     </div>
-    {"<div class='result-link'><a href='" + met_link + "' target='_blank'>View on Met →</a></div>" if met_link else ""}
+    {"<a href='" + met_link + "' target='_blank'>View on Met →</a>" if met_link else ""}
   </div>
 </div>
 """
-            )
+        )
 
-        if rendered == 0:
-            st.info("Results found, but none matched the image filter.")
-            return
+    if rendered == 0:
+        st.info("Results found, but none matched the image filter.")
+        return
 
-        html = f"""
+    html = f"""
 <style>
 .result-grid {{
-  display:grid;
-  grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));
-  gap:24px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 24px;
 }}
 
 .result-card {{
-  background:#0f0f0f;
-  border:1px solid #222;
-  border-radius:6px;
-  overflow:hidden;
+  border: 1px solid #ccc;
+  padding: 8px;
 }}
 
 .result-image img {{
-  width:100%;
-  height:360px;
-  object-fit:contain;
-  background:#000;
-}}
-
-.result-body {{
-  padding:16px;
+  width: 100%;
+  height: auto;
 }}
 
 .result-title {{
-  font-family:var(--serif);
-  font-size:20px;
-  margin-bottom:6px;
-}}
-
-.result-meta {{
-  font-size:14px;
-  color:#ccc;
-  line-height:1.45;
-}}
-
-.result-link {{
-  margin-top:10px;
-  font-size:13px;
+  font-weight: bold;
 }}
 </style>
 
@@ -254,11 +191,7 @@ def render_search_page():
 </div>
 """
 
-        components.html(
-            html,
-            height=min(350 + rendered * 420, 3000),
-            scrolling=True,
-        )
+    components.html(html, height=1200, scrolling=True)
 
 # ============================================================
 # Datasets Page
