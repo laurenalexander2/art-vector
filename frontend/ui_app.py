@@ -13,7 +13,7 @@ from requests.exceptions import ReadTimeout, ConnectionError, HTTPError
 # Config
 # ============================================================
 
-API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+API_BASE = os.getenv("API_BASE", "http://localhost:8000").rstrip("/")
 
 st.set_page_config(
     page_title="ArtVector – Semantic Search for Collections",
@@ -35,7 +35,7 @@ if "query" not in st.session_state:
 if "k" not in st.session_state:
     st.session_state.k = 18
 if "lazy_images" not in st.session_state:
-    st.session_state.lazy_images = 12
+    st.session_state.lazy_images = 12  # resolve images for first N cards
 if "auto_search" not in st.session_state:
     st.session_state.auto_search = False
 
@@ -54,14 +54,12 @@ def api_get(path: str, timeout: Optional[int] = None, retries: int = 2, backoff:
     url = f"{API_BASE}{path}"
     t = timeout or API_TIMEOUTS.get(path, 30)
 
-    last_err = None
     for attempt in range(retries + 1):
         try:
             r = requests.get(url, params=params, timeout=t)
             r.raise_for_status()
             return r.json()
         except (ReadTimeout, ConnectionError) as e:
-            last_err = e
             if attempt < retries:
                 time.sleep(backoff * (2 ** attempt))
                 continue
@@ -75,18 +73,41 @@ def api_post(path: str, files=None, data=None):
     r.raise_for_status()
     return r.json()
 
+@st.cache_data(ttl=10, show_spinner=False)
+def api_is_up() -> bool:
+    # Use /all_datasets as a simple health probe (exists in your backend)
+    try:
+        _ = api_get("/all_datasets", timeout=10, retries=0)
+        return True
+    except Exception:
+        return False
+
+# ============================================================
+# Early connectivity check (prevents stack-trace crash)
+# ============================================================
+
+if not api_is_up():
+    st.sidebar.title("ArtVector")
+    st.error(
+        "Cannot reach backend API.\n\n"
+        f"API_BASE is set to: `{API_BASE}`\n\n"
+        "If you're deployed (e.g., Railway), `localhost` will NOT point to your backend.\n"
+        "Set `API_BASE` on the frontend service to your backend URL and redeploy."
+    )
+    st.stop()
+
 @st.cache_data(ttl=30)
 def load_datasets() -> List[Dict[str, Any]]:
     return api_get("/all_datasets")
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def warm_backend_once():
+    # Optional; harmless if backend doesn't implement /warmup
     try:
         api_get("/warmup", timeout=120, retries=0)
     except Exception:
         pass
 
-# Warm backend once per session (optional but helpful)
 warm_backend_once()
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -94,7 +115,7 @@ def cached_search(q: str, limit: int, dataset_id: Optional[str]):
     return api_get("/search_text", q=q, limit=limit, dataset_id=dataset_id, timeout=180, retries=2)
 
 # ============================================================
-# Image resolution (YOUR RULE: OA -> restricted -> none)
+# Image resolution (YOUR RULE: primaryImageSmall -> primaryImage -> restricted -> none)
 # ============================================================
 
 REQ_HEADERS = {
@@ -153,6 +174,7 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
 
     j = met_object_endpoint(oid)
 
+    # 1) primaryImageSmall
     url = j.get("primaryImageSmall")
     if url:
         fetched = fetch_image_bytes(url)
@@ -160,6 +182,7 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
             bts, ctype = fetched
             return f"data:{ctype};base64,{base64.b64encode(bts).decode('utf-8')}"
 
+    # 2) primaryImage
     url = j.get("primaryImage")
     if url:
         fetched = fetch_image_bytes(url)
@@ -167,6 +190,7 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
             bts, ctype = fetched
             return f"data:{ctype};base64,{base64.b64encode(bts).decode('utf-8')}"
 
+    # 3) forced restricted
     url = met_restricted_iiif_url(oid)
     fetched = fetch_image_bytes(url)
     if fetched:
@@ -324,18 +348,13 @@ def render_upload_page():
             files = {"file": (file.name, file.getvalue(), "text/csv")}
             data = {"name": dataset_name, "source_type": source_type}
             res = api_post("/upload_dataset", files=files, data=data)
-
         st.success(f"Dataset uploaded: `{res['dataset_id']}` · {res['num_objects']} objects.")
 
 def render_object_detail(object_id: str, dataset_id: Optional[str]):
     st.title(f"Object {object_id}")
 
-    # Your backend does not expose /object yet; keep fallback via /all_objects
-    try:
-        objs = api_get("/all_objects", dataset_id=dataset_id, limit=5000, timeout=120, retries=1)
-    except Exception as e:
-        st.error(f"Failed to load objects: {type(e).__name__}: {e}")
-        return
+    # Backend doesn't expose /object, so fallback via /all_objects
+    objs = api_get("/all_objects", dataset_id=dataset_id, limit=5000, timeout=120, retries=1)
 
     obj = None
     for o in objs:
@@ -402,7 +421,7 @@ def render_search_page():
         try:
             res = cached_search(query, st.session_state.k, dataset_id)
         except ReadTimeout:
-            st.error("Search timed out (backend cold-start or large index). Try again, reduce results, or limit dataset.")
+            st.error("Search timed out. Try again, reduce results, or limit to a dataset.")
             return
         except Exception as e:
             st.error(f"Search failed: {type(e).__name__}: {e}")
@@ -419,13 +438,11 @@ def render_search_page():
         if not meta:
             continue
 
+        # expensive: triggers network calls; keep it but warn above
         if images_only and not resolve_met_image_data_url(meta):
             continue
 
-        records.append({
-            "dataset_id": obj.get("dataset_id"),
-            "raw_metadata": meta,
-        })
+        records.append({"dataset_id": obj.get("dataset_id"), "raw_metadata": meta})
 
     if not records:
         st.info("Results found, but none matched your filters (or images are restricted/unavailable).")
@@ -454,11 +471,7 @@ def render_browse_page():
     limit = st.slider("Max objects to load", 100, 5000, 500, step=100)
 
     with st.spinner("Loading objects…"):
-        try:
-            objs = api_get("/all_objects", dataset_id=dataset_id, limit=limit, timeout=120, retries=1)
-        except Exception as e:
-            st.error(f"Failed to load objects: {type(e).__name__}: {e}")
-            return
+        objs = api_get("/all_objects", dataset_id=dataset_id, limit=limit, timeout=120, retries=1)
 
     df = pd.DataFrame(objs)
     st.subheader("Objects")
