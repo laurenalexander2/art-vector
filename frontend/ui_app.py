@@ -1,11 +1,13 @@
 import os
 import base64
+import time
 from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from requests.exceptions import ReadTimeout, ConnectionError, HTTPError
 
 # ============================================================
 # Config
@@ -18,7 +20,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Default landing behavior
 PAGES = ["Semantic Search", "Browse", "Upload & Index"]
 DEFAULT_PAGE = "Semantic Search"
 DEFAULT_QUERY = "modern marble sculpture"
@@ -33,16 +34,40 @@ if "query" not in st.session_state:
     st.session_state.query = DEFAULT_QUERY
 if "k" not in st.session_state:
     st.session_state.k = 18
+if "lazy_images" not in st.session_state:
+    st.session_state.lazy_images = 12
+if "auto_search" not in st.session_state:
+    st.session_state.auto_search = False
 
 # ============================================================
-# API helpers
+# API helpers (timeouts + retries)
 # ============================================================
 
-def api_get(path: str, **params):
+API_TIMEOUTS = {
+    "/search_text": 180,
+    "/warmup": 120,
+    "/all_objects": 120,
+    "/all_datasets": 30,
+}
+
+def api_get(path: str, timeout: Optional[int] = None, retries: int = 2, backoff: float = 0.8, **params):
     url = f"{API_BASE}{path}"
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    t = timeout or API_TIMEOUTS.get(path, 30)
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=t)
+            r.raise_for_status()
+            return r.json()
+        except (ReadTimeout, ConnectionError) as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            raise
+        except HTTPError:
+            raise
 
 def api_post(path: str, files=None, data=None):
     url = f"{API_BASE}{path}"
@@ -53,6 +78,20 @@ def api_post(path: str, files=None, data=None):
 @st.cache_data(ttl=30)
 def load_datasets() -> List[Dict[str, Any]]:
     return api_get("/all_datasets")
+
+@st.cache_data(ttl=3600)
+def warm_backend_once():
+    try:
+        api_get("/warmup", timeout=120, retries=0)
+    except Exception:
+        pass
+
+# Warm backend once per session (optional but helpful)
+warm_backend_once()
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_search(q: str, limit: int, dataset_id: Optional[str]):
+    return api_get("/search_text", q=q, limit=limit, dataset_id=dataset_id, timeout=180, retries=2)
 
 # ============================================================
 # Image resolution (YOUR RULE: OA -> restricted -> none)
@@ -78,7 +117,6 @@ def fetch_image_bytes(url: str) -> Optional[Tuple[bytes, str]]:
             return None
         ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip() or "image/jpeg"
         content = r.content
-        # tiny payloads are often HTML error pages
         if len(content) < 1024:
             return None
         return content, ctype
@@ -115,7 +153,6 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
 
     j = met_object_endpoint(oid)
 
-    # 1) primaryImageSmall
     url = j.get("primaryImageSmall")
     if url:
         fetched = fetch_image_bytes(url)
@@ -123,7 +160,6 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
             bts, ctype = fetched
             return f"data:{ctype};base64,{base64.b64encode(bts).decode('utf-8')}"
 
-    # 2) primaryImage
     url = j.get("primaryImage")
     if url:
         fetched = fetch_image_bytes(url)
@@ -131,18 +167,16 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
             bts, ctype = fetched
             return f"data:{ctype};base64,{base64.b64encode(bts).decode('utf-8')}"
 
-    # 3) forced restricted
     url = met_restricted_iiif_url(oid)
     fetched = fetch_image_bytes(url)
     if fetched:
         bts, ctype = fetched
         return f"data:{ctype};base64,{base64.b64encode(bts).decode('utf-8')}"
 
-    # 4) none
     return None
 
 # ============================================================
-# UI: Card rendering (CSS works; images are embedded)
+# UI: Card rendering
 # ============================================================
 
 CARD_CSS = """
@@ -199,9 +233,9 @@ CARD_CSS = """
 </style>
 """
 
-def render_cards(records: List[Dict[str, Any]], height: int = 1100):
+def render_cards(records: List[Dict[str, Any]], height: int = 1100, resolve_images_for_first_n: int = 12):
     cards_html = []
-    for rec in records:
+    for idx, rec in enumerate(records):
         meta = rec.get("raw_metadata") or {}
 
         title = meta.get("Title") or meta.get("title") or "Untitled"
@@ -213,16 +247,15 @@ def render_cards(records: List[Dict[str, Any]], height: int = 1100):
         object_id = meta.get("Object ID") or meta.get("objectID") or meta.get("object_id") or ""
         dataset_id = rec.get("dataset_id") or rec.get("dataset") or ""
 
-        # Links
         met_link = meta.get("Link Resource") or meta.get("objectURL") or ""
-        detail_link = (
-            f"?page=Semantic%20Search&object={object_id}&dataset={dataset_id}"
-            if object_id else ""
-        )
+        detail_link = f"?page=Semantic%20Search&object={object_id}&dataset={dataset_id}" if object_id else ""
 
-        img_data_url = resolve_met_image_data_url(meta)
+        img_data_url = None
+        if idx < resolve_images_for_first_n:
+            img_data_url = resolve_met_image_data_url(meta)
+
         img_tag = f'<img class="av-img" src="{img_data_url}" />' if img_data_url else '<div class="av-img"></div>'
-        badge = "image" if img_data_url else "no image"
+        badge = "image" if img_data_url else ("skipped" if idx >= resolve_images_for_first_n else "no image")
 
         cards_html.append(f"""
 <div class="av-card">
@@ -254,7 +287,7 @@ def render_cards(records: List[Dict[str, Any]], height: int = 1100):
     components.html(html, height=height, scrolling=True)
 
 # ============================================================
-# Query param helpers (object detail routing)
+# Query param helpers
 # ============================================================
 
 qp = dict(st.query_params)
@@ -269,7 +302,6 @@ def qp_get(key: str) -> Optional[str]:
         return v
     return None
 
-# allow ?page=... to control the sidebar default
 qp_page = qp_get("page")
 if qp_page in PAGES:
     st.session_state.page = qp_page
@@ -298,25 +330,20 @@ def render_upload_page():
 def render_object_detail(object_id: str, dataset_id: Optional[str]):
     st.title(f"Object {object_id}")
 
-    # If your backend has a dedicated endpoint, use it.
-    # Otherwise, fall back to pulling from all_objects and filtering.
-    obj = None
+    # Your backend does not expose /object yet; keep fallback via /all_objects
     try:
-        obj = api_get("/object", object_id=object_id, dataset_id=dataset_id)
-    except Exception:
-        pass
+        objs = api_get("/all_objects", dataset_id=dataset_id, limit=5000, timeout=120, retries=1)
+    except Exception as e:
+        st.error(f"Failed to load objects: {type(e).__name__}: {e}")
+        return
 
-    if not obj:
-        try:
-            objs = api_get("/all_objects", dataset_id=dataset_id, limit=5000)
-            for o in objs:
-                meta = o.get("raw_metadata") or o
-                oid = meta.get("Object ID") or meta.get("object_id") or meta.get("objectID")
-                if str(oid) == str(object_id):
-                    obj = o
-                    break
-        except Exception:
-            obj = None
+    obj = None
+    for o in objs:
+        meta = o.get("raw_metadata") or o
+        oid = meta.get("Object ID") or meta.get("object_id") or meta.get("objectID")
+        if str(oid) == str(object_id):
+            obj = o
+            break
 
     if not obj:
         st.warning("Object not found.")
@@ -341,17 +368,18 @@ def render_search_page():
     selected = st.selectbox("Limit search to dataset", dataset_options)
     dataset_id = None if selected == "All datasets" else selected
 
-    # Default query you requested
     st.session_state.query = st.text_input(
         "Enter a meaning-based query",
         value=st.session_state.query,
         key="query_input",
     )
 
-    images_only = st.checkbox("Only show objects with retrievable images", value=False)
+    images_only = st.checkbox("Only show objects with retrievable images (slower)", value=False)
     st.session_state.k = st.slider("Results to show", 6, 48, st.session_state.k)
 
-    # object detail route (from link)
+    st.session_state.auto_search = st.checkbox("Auto-search on change", value=st.session_state.auto_search)
+    st.session_state.lazy_images = st.slider("Resolve images for first N results", 0, 48, st.session_state.lazy_images)
+
     object_id = qp_get("object")
     qp_dataset = qp_get("dataset")
     if object_id:
@@ -363,8 +391,22 @@ def render_search_page():
     if not query:
         return
 
+    do_search = True
+    if not st.session_state.auto_search:
+        do_search = st.button("Search")
+
+    if not do_search:
+        return
+
     with st.spinner("Searching…"):
-        res = api_get("/search_text", q=query, limit=st.session_state.k, dataset_id=dataset_id)
+        try:
+            res = cached_search(query, st.session_state.k, dataset_id)
+        except ReadTimeout:
+            st.error("Search timed out (backend cold-start or large index). Try again, reduce results, or limit dataset.")
+            return
+        except Exception as e:
+            st.error(f"Search failed: {type(e).__name__}: {e}")
+            return
 
     if not res:
         st.warning("No results found.")
@@ -374,7 +416,6 @@ def render_search_page():
     for r in res:
         obj = r.get("obj") or {}
         meta = obj.get("raw_metadata") or {}
-
         if not meta:
             continue
 
@@ -390,7 +431,7 @@ def render_search_page():
         st.info("Results found, but none matched your filters (or images are restricted/unavailable).")
         return
 
-    render_cards(records)
+    render_cards(records, resolve_images_for_first_n=st.session_state.lazy_images)
 
 def render_browse_page():
     st.title("Browse (Datasets + Objects)")
@@ -413,7 +454,11 @@ def render_browse_page():
     limit = st.slider("Max objects to load", 100, 5000, 500, step=100)
 
     with st.spinner("Loading objects…"):
-        objs = api_get("/all_objects", dataset_id=dataset_id, limit=limit)
+        try:
+            objs = api_get("/all_objects", dataset_id=dataset_id, limit=limit, timeout=120, retries=1)
+        except Exception as e:
+            st.error(f"Failed to load objects: {type(e).__name__}: {e}")
+            return
 
     df = pd.DataFrame(objs)
     st.subheader("Objects")
