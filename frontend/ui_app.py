@@ -22,7 +22,7 @@ st.set_page_config(
 
 PAGES = ["Semantic Search", "Browse", "Upload & Index"]
 DEFAULT_PAGE = "Semantic Search"
-DEFAULT_QUERY = "modern marble sculpture"
+DEFAULT_QUERY = "modern sculpture, marble or bronze"
 
 # ============================================================
 # Session defaults
@@ -34,8 +34,6 @@ if "query" not in st.session_state:
     st.session_state.query = DEFAULT_QUERY
 if "k" not in st.session_state:
     st.session_state.k = 18
-if "lazy_images" not in st.session_state:
-    st.session_state.lazy_images = 12  # resolve images for first N cards
 if "auto_search" not in st.session_state:
     st.session_state.auto_search = False
 
@@ -50,7 +48,13 @@ API_TIMEOUTS = {
     "/all_datasets": 30,
 }
 
-def api_get(path: str, timeout: Optional[int] = None, retries: int = 2, backoff: float = 0.8, **params):
+def api_get(
+    path: str,
+    timeout: Optional[int] = None,
+    retries: int = 2,
+    backoff: float = 0.8,
+    **params
+):
     url = f"{API_BASE}{path}"
     t = timeout or API_TIMEOUTS.get(path, 30)
 
@@ -59,7 +63,7 @@ def api_get(path: str, timeout: Optional[int] = None, retries: int = 2, backoff:
             r = requests.get(url, params=params, timeout=t)
             r.raise_for_status()
             return r.json()
-        except (ReadTimeout, ConnectionError) as e:
+        except (ReadTimeout, ConnectionError):
             if attempt < retries:
                 time.sleep(backoff * (2 ** attempt))
                 continue
@@ -75,7 +79,6 @@ def api_post(path: str, files=None, data=None):
 
 @st.cache_data(ttl=10, show_spinner=False)
 def api_is_up() -> bool:
-    # Use /all_datasets as a simple health probe (exists in your backend)
     try:
         _ = api_get("/all_datasets", timeout=10, retries=0)
         return True
@@ -102,7 +105,6 @@ def load_datasets() -> List[Dict[str, Any]]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def warm_backend_once():
-    # Optional; harmless if backend doesn't implement /warmup
     try:
         api_get("/warmup", timeout=120, retries=0)
     except Exception:
@@ -174,7 +176,6 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
 
     j = met_object_endpoint(oid)
 
-    # 1) primaryImageSmall
     url = j.get("primaryImageSmall")
     if url:
         fetched = fetch_image_bytes(url)
@@ -182,7 +183,6 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
             bts, ctype = fetched
             return f"data:{ctype};base64,{base64.b64encode(bts).decode('utf-8')}"
 
-    # 2) primaryImage
     url = j.get("primaryImage")
     if url:
         fetched = fetch_image_bytes(url)
@@ -190,7 +190,6 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
             bts, ctype = fetched
             return f"data:{ctype};base64,{base64.b64encode(bts).decode('utf-8')}"
 
-    # 3) forced restricted
     url = met_restricted_iiif_url(oid)
     fetched = fetch_image_bytes(url)
     if fetched:
@@ -200,16 +199,28 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
     return None
 
 # ============================================================
-# UI: Card rendering
+# UI: Card rendering (Font fix: force system font stack)
 # ============================================================
 
 CARD_CSS = """
 <style>
+:root {
+  --av-font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+             Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
 .av-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
   gap: 18px;
 }
+
+.av-card, .av-card * {
+  font-family: var(--av-font) !important;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
 .av-card {
   border: 1px solid rgba(0,0,0,0.12);
   border-radius: 16px;
@@ -217,6 +228,7 @@ CARD_CSS = """
   background: white;
   box-shadow: 0 2px 10px rgba(0,0,0,0.04);
 }
+
 .av-img {
   width: 100%;
   aspect-ratio: 4 / 3;
@@ -224,25 +236,30 @@ CARD_CSS = """
   display: block;
   background: #f3f3f3;
 }
+
 .av-body {
   padding: 12px 12px 14px 12px;
 }
+
 .av-title {
   font-size: 14px;
   font-weight: 650;
   line-height: 1.25;
   margin-bottom: 6px;
 }
+
 .av-meta {
   font-size: 12px;
   opacity: 0.75;
   line-height: 1.35;
   margin-bottom: 10px;
 }
+
 .av-links a {
   font-size: 12px;
   text-decoration: none;
 }
+
 .av-badge {
   position: absolute;
   top: 10px;
@@ -253,13 +270,14 @@ CARD_CSS = """
   background: rgba(0,0,0,0.55);
   color: white;
 }
+
 .av-imgwrap { position: relative; }
 </style>
 """
 
-def render_cards(records: List[Dict[str, Any]], height: int = 1100, resolve_images_for_first_n: int = 12):
+def render_cards(records: List[Dict[str, Any]], height: int = 1100):
     cards_html = []
-    for idx, rec in enumerate(records):
+    for rec in records:
         meta = rec.get("raw_metadata") or {}
 
         title = meta.get("Title") or meta.get("title") or "Untitled"
@@ -268,18 +286,11 @@ def render_cards(records: List[Dict[str, Any]], height: int = 1100, resolve_imag
         medium = meta.get("Medium") or meta.get("medium") or ""
         place = meta.get("Culture") or meta.get("Country") or meta.get("place") or ""
 
-        object_id = meta.get("Object ID") or meta.get("objectID") or meta.get("object_id") or ""
-        dataset_id = rec.get("dataset_id") or rec.get("dataset") or ""
-
         met_link = meta.get("Link Resource") or meta.get("objectURL") or ""
-        detail_link = f"?page=Semantic%20Search&object={object_id}&dataset={dataset_id}" if object_id else ""
 
-        img_data_url = None
-        if idx < resolve_images_for_first_n:
-            img_data_url = resolve_met_image_data_url(meta)
-
+        img_data_url = resolve_met_image_data_url(meta)
         img_tag = f'<img class="av-img" src="{img_data_url}" />' if img_data_url else '<div class="av-img"></div>'
-        badge = "image" if img_data_url else ("skipped" if idx >= resolve_images_for_first_n else "no image")
+        badge = "image" if img_data_url else "no image"
 
         cards_html.append(f"""
 <div class="av-card">
@@ -296,8 +307,7 @@ def render_cards(records: List[Dict[str, Any]], height: int = 1100, resolve_imag
       {place}
     </div>
     <div class="av-links">
-      {"<a href='" + met_link + "' target='_blank'>View source →</a><br/>" if met_link else ""}
-      {"<a href='" + detail_link + "'>Open object →</a>" if detail_link else ""}
+      {"<a href='" + met_link + "' target='_blank'>View source →</a>" if met_link else ""}
     </div>
   </div>
 </div>
@@ -309,26 +319,6 @@ def render_cards(records: List[Dict[str, Any]], height: int = 1100, resolve_imag
 </div>
 """
     components.html(html, height=height, scrolling=True)
-
-# ============================================================
-# Query param helpers
-# ============================================================
-
-qp = dict(st.query_params)
-
-def qp_get(key: str) -> Optional[str]:
-    v = qp.get(key)
-    if v is None:
-        return None
-    if isinstance(v, list) and len(v) > 0:
-        return v[0]
-    if isinstance(v, str):
-        return v
-    return None
-
-qp_page = qp_get("page")
-if qp_page in PAGES:
-    st.session_state.page = qp_page
 
 # ============================================================
 # Pages
@@ -350,35 +340,6 @@ def render_upload_page():
             res = api_post("/upload_dataset", files=files, data=data)
         st.success(f"Dataset uploaded: `{res['dataset_id']}` · {res['num_objects']} objects.")
 
-def render_object_detail(object_id: str, dataset_id: Optional[str]):
-    st.title(f"Object {object_id}")
-
-    # Backend doesn't expose /object, so fallback via /all_objects
-    objs = api_get("/all_objects", dataset_id=dataset_id, limit=5000, timeout=120, retries=1)
-
-    obj = None
-    for o in objs:
-        meta = o.get("raw_metadata") or o
-        oid = meta.get("Object ID") or meta.get("object_id") or meta.get("objectID")
-        if str(oid) == str(object_id):
-            obj = o
-            break
-
-    if not obj:
-        st.warning("Object not found.")
-        return
-
-    meta = obj.get("raw_metadata") or obj
-
-    img = resolve_met_image_data_url(meta)
-    if img:
-        components.html(CARD_CSS + f'<img class="av-img" src="{img}" />', height=420)
-    else:
-        st.info("No retrievable image for this object (restricted or missing).")
-
-    st.subheader("Metadata")
-    st.json(meta)
-
 def render_search_page():
     st.title("Semantic Search")
 
@@ -394,17 +355,11 @@ def render_search_page():
     )
 
     images_only = st.checkbox("Only show objects with retrievable images (slower)", value=False)
-    st.session_state.k = st.slider("Results to show", 6, 48, st.session_state.k)
+
+    # CHANGE: results slider 2-50
+    st.session_state.k = st.slider("Results to show", 2, 50, st.session_state.k)
 
     st.session_state.auto_search = st.checkbox("Auto-search on change", value=st.session_state.auto_search)
-    st.session_state.lazy_images = st.slider("Resolve images for first N results", 0, 48, st.session_state.lazy_images)
-
-    object_id = qp_get("object")
-    qp_dataset = qp_get("dataset")
-    if object_id:
-        render_object_detail(object_id=object_id, dataset_id=qp_dataset or dataset_id)
-        st.markdown("← Use your browser back button to return to results.")
-        return
 
     query = st.session_state.query.strip()
     if not query:
@@ -438,17 +393,16 @@ def render_search_page():
         if not meta:
             continue
 
-        # expensive: triggers network calls; keep it but warn above
         if images_only and not resolve_met_image_data_url(meta):
             continue
 
-        records.append({"dataset_id": obj.get("dataset_id"), "raw_metadata": meta})
+        records.append({"raw_metadata": meta})
 
     if not records:
         st.info("Results found, but none matched your filters (or images are restricted/unavailable).")
         return
 
-    render_cards(records, resolve_images_for_first_n=st.session_state.lazy_images)
+    render_cards(records)
 
 def render_browse_page():
     st.title("Browse (Datasets + Objects)")
