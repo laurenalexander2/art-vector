@@ -35,7 +35,9 @@ if "query" not in st.session_state:
 if "k" not in st.session_state:
     st.session_state.k = 18
 if "auto_search" not in st.session_state:
-    st.session_state.auto_search = False
+    st.session_state.auto_search = False  # user-controlled; we still do one initial run
+if "did_initial_search" not in st.session_state:
+    st.session_state.did_initial_search = False
 
 # ============================================================
 # API helpers (timeouts + retries)
@@ -43,9 +45,9 @@ if "auto_search" not in st.session_state:
 
 API_TIMEOUTS = {
     "/search_text": 180,
-    "/warmup": 120,
+    "/warmup": 180,
     "/all_objects": 120,
-    "/all_datasets": 30,
+    "/all_datasets": 60,
 }
 
 def api_get(
@@ -77,19 +79,29 @@ def api_post(path: str, files=None, data=None):
     r.raise_for_status()
     return r.json()
 
-@st.cache_data(ttl=10, show_spinner=False)
-def api_is_up() -> bool:
-    try:
-        _ = api_get("/all_datasets", timeout=10, retries=0)
-        return True
-    except Exception:
-        return False
+def wait_for_backend(max_wait_seconds: int = 45) -> bool:
+    """
+    Handles cold starts: keep probing for a bit before giving up.
+    """
+    start = time.time()
+    last_err = None
+    while time.time() - start < max_wait_seconds:
+        try:
+            _ = api_get("/all_datasets", timeout=10, retries=0)
+            return True
+        except Exception as e:
+            last_err = e
+            time.sleep(2)
+    return False
 
 # ============================================================
-# Early connectivity check (prevents stack-trace crash)
+# Startup connectivity (patient + clear error)
 # ============================================================
 
-if not api_is_up():
+with st.spinner("Connecting to backend…"):
+    backend_ok = wait_for_backend(max_wait_seconds=45)
+
+if not backend_ok:
     st.sidebar.title("ArtVector")
     st.error(
         "Cannot reach backend API.\n\n"
@@ -101,12 +113,13 @@ if not api_is_up():
 
 @st.cache_data(ttl=30)
 def load_datasets() -> List[Dict[str, Any]]:
-    return api_get("/all_datasets")
+    return api_get("/all_datasets", timeout=60, retries=1)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def warm_backend_once():
+    # Optional; harmless if backend doesn't implement /warmup
     try:
-        api_get("/warmup", timeout=120, retries=0)
+        api_get("/warmup", timeout=180, retries=0)
     except Exception:
         pass
 
@@ -117,7 +130,7 @@ def cached_search(q: str, limit: int, dataset_id: Optional[str]):
     return api_get("/search_text", q=q, limit=limit, dataset_id=dataset_id, timeout=180, retries=2)
 
 # ============================================================
-# Image resolution (YOUR RULE: primaryImageSmall -> primaryImage -> restricted -> none)
+# Image resolution (primaryImageSmall -> primaryImage -> restricted -> none)
 # ============================================================
 
 REQ_HEADERS = {
@@ -161,11 +174,6 @@ def met_restricted_iiif_url(object_id: str) -> str:
     return f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{object_id}/restricted"
 
 def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
-    """
-    Enforces:
-      primaryImageSmall -> primaryImage -> forced restricted -> None
-    Returns base64 data URL or None.
-    """
     object_id = meta.get("Object ID") or meta.get("objectID") or meta.get("object_id")
     if not object_id:
         return None
@@ -199,7 +207,7 @@ def resolve_met_image_data_url(meta: Dict[str, Any]) -> Optional[str]:
     return None
 
 # ============================================================
-# UI: Card rendering (Font fix: force system font stack)
+# UI: Card rendering (fonts fixed inside iframe)
 # ============================================================
 
 CARD_CSS = """
@@ -259,6 +267,8 @@ CARD_CSS = """
   font-size: 12px;
   text-decoration: none;
 }
+
+.av-links a:hover { text-decoration: underline; }
 
 .av-badge {
   position: absolute;
@@ -356,18 +366,22 @@ def render_search_page():
 
     images_only = st.checkbox("Only show objects with retrievable images (slower)", value=False)
 
-    # CHANGE: results slider 2-50
+    # Slider range 2-50
     st.session_state.k = st.slider("Results to show", 2, 50, st.session_state.k)
 
+    # Keep your manual/auto workflow, but we ALSO do an initial auto-run once.
     st.session_state.auto_search = st.checkbox("Auto-search on change", value=st.session_state.auto_search)
 
     query = st.session_state.query.strip()
     if not query:
         return
 
-    do_search = True
-    if not st.session_state.auto_search:
-        do_search = st.button("Search")
+    # --- KEY CHANGE: initial auto search on first load ---
+    if not st.session_state.did_initial_search:
+        do_search = True
+        st.session_state.did_initial_search = True
+    else:
+        do_search = True if st.session_state.auto_search else st.button("Search")
 
     if not do_search:
         return
