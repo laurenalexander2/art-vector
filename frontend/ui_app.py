@@ -148,7 +148,7 @@ def render_search_page():
 
     query = st.text_input(
         "Enter a meaning-based query",
-        value="artworks that evoke vastness or awe",
+        value="modern marble sculpture",
     )
 
     k = st.slider("Results to show", 5, 50, 20)
