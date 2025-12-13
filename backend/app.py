@@ -7,7 +7,7 @@ import time
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import torch
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
@@ -35,7 +35,8 @@ EMBED_THREADS: Dict[str, threading.Thread] = {}
 THREAD_LOCK = threading.Lock()
 
 SEARCH_CACHE_LOCK = threading.Lock()
-SEARCH_CACHE: Dict[tuple, Dict[str, Any]] = {}
+# key: (dataset_id or "__all__", images_only) -> {"tensor": torch.Tensor|None, "rows": [...], "sig": int}
+SEARCH_CACHE: Dict[Tuple[str, bool], Dict[str, Any]] = {}
 
 # -----------------------------
 # DB helpers
@@ -82,9 +83,7 @@ def init_db():
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_objects_dataset ON objects(dataset_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_objects_has_image ON objects(has_image);")
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS idx_objects_dataset_has_image ON objects(dataset_id, has_image);"
-    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_objects_dataset_has_image ON objects(dataset_id, has_image);")
 
     conn.commit()
     conn.close()
@@ -105,7 +104,7 @@ configure_db()
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="ArtVector API", version="0.6.0")
+app = FastAPI(title="ArtVector API", version="0.6.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -180,6 +179,128 @@ def build_object_uid(dataset_id, original_id):
 
 
 # -----------------------------
+# Cache helpers (store "index" in RAM)
+# -----------------------------
+def _cache_signature(dataset_id: Optional[str], images_only: bool) -> int:
+    """
+    Cheaper-than-COUNT signature. If any embedded row changes, MAX(id) changes.
+    """
+    conn = get_db()
+    q = "SELECT MAX(id) FROM objects WHERE embedding IS NOT NULL"
+    params: List[Any] = []
+    if dataset_id:
+        q += " AND dataset_id=?"
+        params.append(dataset_id)
+    if images_only:
+        q += " AND has_image=1"
+    sig = conn.execute(q, params).fetchone()[0]
+    conn.close()
+    return int(sig or 0)
+
+
+def _build_search_cache(dataset_id: Optional[str], images_only: bool) -> Dict[str, Any]:
+    conn = get_db()
+    q = """
+        SELECT object_uid, dataset_id, original_id, title, artist,
+               image_url, has_image, embedding
+        FROM objects
+        WHERE embedding IS NOT NULL
+    """
+    params: List[Any] = []
+    if dataset_id:
+        q += " AND dataset_id=?"
+        params.append(dataset_id)
+    if images_only:
+        q += " AND has_image=1"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+
+    vecs = []
+    meta = []
+
+    for r in rows:
+        # embedding stored as JSON list
+        try:
+            vecs.append(json.loads(r["embedding"]))
+        except Exception:
+            continue
+
+        meta.append(
+            {
+                "object_uid": r["object_uid"],
+                "dataset_id": r["dataset_id"],
+                "original_id": r["original_id"],
+                "title": r["title"],
+                "artist": r["artist"],
+                "image_url": r["image_url"],
+                "has_image": bool(r["has_image"]),
+            }
+        )
+
+    tensor = torch.tensor(vecs, dtype=torch.float32) if vecs else None
+    return {"tensor": tensor, "rows": meta}
+
+
+def _ensure_cache(dataset_id: Optional[str], images_only: bool) -> Dict[str, Any]:
+    key: Tuple[str, bool] = (dataset_id or "__all__", images_only)
+    sig = _cache_signature(dataset_id, images_only)
+
+    with SEARCH_CACHE_LOCK:
+        cache = SEARCH_CACHE.get(key)
+        if cache is None or cache.get("sig") != sig:
+            cache = _build_search_cache(dataset_id, images_only)
+            cache["sig"] = sig
+            SEARCH_CACHE[key] = cache
+        return cache
+
+
+def _warm_all_caches() -> None:
+    """
+    Warm embedder + build default caches once at server startup.
+    Keeps your "index" in RAM so first user query is fast.
+    """
+    # Warm model
+    try:
+        _ = embed_texts(["warmup"]).cpu()
+    except Exception as e:
+        print("Warmup: embedder failed:", e)
+
+    # Only warm caches that make sense
+    try:
+        # All datasets, images_only False
+        _ensure_cache(dataset_id=None, images_only=False)
+
+        # Optional: warm images_only True (can be large; comment out if you prefer lazy)
+        _ensure_cache(dataset_id=None, images_only=True)
+
+        # Optional: per-dataset warm (only do if #datasets is small)
+        conn = get_db()
+        ds_rows = conn.execute("SELECT dataset_id FROM datasets").fetchall()
+        conn.close()
+
+        # If you expect many datasets, remove this loop.
+        for r in ds_rows:
+            dsid = r["dataset_id"]
+            _ensure_cache(dataset_id=dsid, images_only=False)
+    except Exception as e:
+        print("Warmup: cache build failed:", e)
+
+
+@app.on_event("startup")
+def on_startup():
+    _warm_all_caches()
+
+
+@app.get("/warmup")
+def warmup_endpoint():
+    """
+    Lets you explicitly warm the backend from the frontend if you want.
+    """
+    _warm_all_caches()
+    return {"ok": True, "cache_keys": len(SEARCH_CACHE)}
+
+
+# -----------------------------
 # Upload dataset
 # -----------------------------
 @app.post("/upload_dataset")
@@ -251,12 +372,13 @@ async def upload_dataset(
         )
         conn.commit()
 
-    conn.execute(
-        "UPDATE datasets SET num_objects=? WHERE dataset_id=?",
-        (count, dataset_id),
-    )
+    conn.execute("UPDATE datasets SET num_objects=? WHERE dataset_id=?", (count, dataset_id))
     conn.commit()
     conn.close()
+
+    # Invalidate caches (new dataset changes result sets once embeddings exist)
+    with SEARCH_CACHE_LOCK:
+        SEARCH_CACHE.clear()
 
     return {"dataset_id": dataset_id, "num_objects": count}
 
@@ -319,58 +441,8 @@ def all_objects(dataset_id: Optional[str] = None, limit: int = 500):
 
 
 # -----------------------------
-# Optimized semantic search
+# Semantic search
 # -----------------------------
-def _count_embedded(dataset_id, images_only):
-    conn = get_db()
-    q = "SELECT COUNT(*) FROM objects WHERE embedding IS NOT NULL"
-    params = []
-    if dataset_id:
-        q += " AND dataset_id=?"
-        params.append(dataset_id)
-    if images_only:
-        q += " AND has_image=1"
-    c = conn.execute(q, params).fetchone()[0]
-    conn.close()
-    return c
-
-
-def _build_search_cache(dataset_id, images_only):
-    conn = get_db()
-    q = """
-        SELECT object_uid, dataset_id, original_id, title, artist,
-               image_url, has_image, embedding
-        FROM objects WHERE embedding IS NOT NULL
-    """
-    params = []
-    if dataset_id:
-        q += " AND dataset_id=?"
-        params.append(dataset_id)
-    if images_only:
-        q += " AND has_image=1"
-    rows = conn.execute(q, params).fetchall()
-    conn.close()
-
-    vecs = []
-    meta = []
-    for r in rows:
-        vecs.append(json.loads(r["embedding"]))
-        meta.append(
-            {
-                "object_uid": r["object_uid"],
-                "dataset_id": r["dataset_id"],
-                "original_id": r["original_id"],
-                "title": r["title"],
-                "artist": r["artist"],
-                "image_url": r["image_url"],
-                "has_image": bool(r["has_image"]),
-            }
-        )
-
-    tensor = torch.tensor(vecs, dtype=torch.float32) if vecs else None
-    return {"tensor": tensor, "rows": meta, "embedded_count": len(meta)}
-
-
 @app.get("/search_text", response_model=List[SearchResult])
 def search_text(
     q: str,
@@ -381,40 +453,43 @@ def search_text(
     if not q:
         raise HTTPException(400, "Query required")
 
-    key = (dataset_id or "__all__", images_only)
-    count = _count_embedded(dataset_id, images_only)
+    cache = _ensure_cache(dataset_id, images_only)
 
-    with SEARCH_CACHE_LOCK:
-        cache = SEARCH_CACHE.get(key)
-        if cache is None or cache["embedded_count"] != count:
-            cache = _build_search_cache(dataset_id, images_only)
-            SEARCH_CACHE[key] = cache
-
-    if not cache["tensor"] is not None:
+    # BUGFIX: correct None check
+    if cache["tensor"] is None:
         return []
 
-    query_vec = embed_texts([q]).cpu()[0]
-    scores = torch.matmul(cache["tensor"], query_vec)
+    query_vec = embed_texts([q]).cpu()[0]  # (384,)
+    scores = torch.matmul(cache["tensor"], query_vec)  # (N,)
 
     k = min(limit, scores.numel())
+    if k <= 0:
+        return []
+
     vals, idxs = torch.topk(scores, k=k)
+
+    # Fetch raw_metadata for returned rows
+    uids = [cache["rows"][i]["object_uid"] for i in idxs.tolist()]
 
     conn = get_db()
     meta_rows = conn.execute(
         f"SELECT object_uid, raw_metadata FROM objects WHERE object_uid IN ({','.join(['?']*k)})",
-        [cache["rows"][i]["object_uid"] for i in idxs.tolist()],
+        uids,
     ).fetchall()
     conn.close()
 
     meta_map = {r["object_uid"]: json.loads(r["raw_metadata"] or "{}") for r in meta_rows}
 
-    return [
-        SearchResult(
-            score=float(vals[i]),
-            obj=ObjectOut(
-                **cache["rows"][idxs[i]],
-                raw_metadata=meta_map.get(cache["rows"][idxs[i]]["object_uid"], {}),
-            ),
+    out: List[SearchResult] = []
+    for i in range(k):
+        row_meta = cache["rows"][idxs[i]]
+        out.append(
+            SearchResult(
+                score=float(vals[i]),
+                obj=ObjectOut(
+                    **row_meta,
+                    raw_metadata=meta_map.get(row_meta["object_uid"], {}),
+                ),
+            )
         )
-        for i in range(k)
-    ]
+    return out
