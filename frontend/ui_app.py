@@ -4,26 +4,17 @@ from typing import List, Dict, Any
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ============================================================
-# Restricted image resolver (Met IIIF)
+# Met restricted image resolver (optimistic IIIF)
 # ============================================================
 
 @st.cache_data(ttl=3600)
 def resolve_restricted_image(object_id: str) -> str | None:
     if not object_id:
         return None
-
-    url = f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{object_id}/restricted"
-
-    try:
-        r = requests.head(url, timeout=2)
-        if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
-            return url
-    except Exception:
-        pass
-
-    return None
+    return f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{object_id}/restricted"
 
 
 # ============================================================
@@ -56,55 +47,6 @@ h1, h2, h3 {
     font-family:var(--serif);
     font-weight:400 !important;
 }
-
-/* Result cards */
-
-.result-grid {
-    display:grid;
-    grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));
-    gap:24px;
-}
-
-.result-card {
-    background:#0f0f0f;
-    border:1px solid #222;
-    border-radius:6px;
-    overflow:hidden;
-    transition:transform 0.2s ease, border-color 0.2s ease;
-}
-
-.result-card:hover {
-    transform:translateY(-2px);
-    border-color:#444;
-}
-
-.result-image img {
-    width:100%;
-    height:360px;
-    object-fit:contain;
-    background:#000;
-}
-
-.result-body {
-    padding:16px;
-}
-
-.result-title {
-    font-family:var(--serif);
-    font-size:20px;
-    margin-bottom:6px;
-}
-
-.result-meta {
-    font-size:14px;
-    line-height:1.45;
-    color:#ccc;
-}
-
-.result-link {
-    margin-top:10px;
-    font-size:13px;
-}
 </style>
 """,
         unsafe_allow_html=True,
@@ -134,19 +76,19 @@ page = st.sidebar.radio("Navigation", PAGES)
 
 def api_get(path: str, **params):
     url = f"{API_BASE}{path}"
-    resp = requests.get(url, params=params)
-    resp.raise_for_status()
-    return resp.json()
+    r = requests.get(url, params=params)
+    r.raise_for_status()
+    return r.json()
 
 
 def api_post(path: str, files=None, data=None, json_body=None):
     url = f"{API_BASE}{path}"
     if json_body is not None:
-        resp = requests.post(url, json=json_body)
+        r = requests.post(url, json=json_body)
     else:
-        resp = requests.post(url, files=files, data=data)
-    resp.raise_for_status()
-    return resp.json()
+        r = requests.post(url, files=files, data=data)
+    r.raise_for_status()
+    return r.json()
 
 
 @st.cache_data(ttl=10)
@@ -166,7 +108,7 @@ def render_upload_page():
         source_type = st.text_input("Source type", value="museum")
         submitted = st.form_submit_button("Upload")
 
-    if submitted and file is not None:
+    if submitted and file:
         with st.spinner("Uploading and ingesting dataset…"):
             files = {"file": (file.name, file.getvalue(), "text/csv")}
             data = {"name": dataset_name, "source_type": source_type}
@@ -177,7 +119,7 @@ def render_upload_page():
         )
 
 # ============================================================
-# Semantic Search Page (CARD VIEW)
+# Semantic Search Page (CARD GRID)
 # ============================================================
 
 def render_search_page():
@@ -188,7 +130,7 @@ def render_search_page():
     selected = st.selectbox("Limit search to dataset", dataset_options)
     dataset_id = None if selected == "All datasets" else selected
 
-    images_only = st.checkbox("Only show objects with images", value=True)
+    images_only = st.checkbox("Only show objects with images", value=False)
 
     query = st.text_input("Enter a meaning-based query")
     k = st.slider("Results to show", 6, 48, 18)
@@ -206,17 +148,19 @@ def render_search_page():
             st.warning("No results found.")
             return
 
-        cards_html = ['<div class="result-grid">']
+        cards = []
+        rendered = 0
 
         for r in res:
             obj = r["obj"]
-            score = r["score"]
 
             object_id = obj.get("original_id")
             image_url = obj.get("image_url") or resolve_restricted_image(object_id)
 
             if images_only and not image_url:
                 continue
+
+            rendered += 1
 
             title = obj.get("title") or "Untitled"
             artist = obj.get("artist") or "Unknown artist"
@@ -230,29 +174,84 @@ def render_search_page():
                 else None
             )
 
-            cards_html.append(
+            cards.append(
                 f"""
 <div class="result-card">
-    <div class="result-image">
-        {"<img src='" + image_url + "' />" if image_url else ""}
+  <div class="result-image">
+    {"<img src='" + image_url + "' />" if image_url else ""}
+  </div>
+  <div class="result-body">
+    <div class="result-title">{title}</div>
+    <div class="result-meta">
+      {artist}<br>
+      {date}<br>
+      {medium}<br>
+      {place}
     </div>
-    <div class="result-body">
-        <div class="result-title">{title}</div>
-        <div class="result-meta">
-            {artist}<br>
-            {date}<br>
-            {medium}<br>
-            {place}
-        </div>
-        {"<div class='result-link'><a href='" + met_link + "' target='_blank'>View on Met →</a></div>" if met_link else ""}
-    </div>
+    {"<div class='result-link'><a href='" + met_link + "' target='_blank'>View on Met →</a></div>" if met_link else ""}
+  </div>
 </div>
 """
             )
 
-        cards_html.append("</div>")
+        if rendered == 0:
+            st.info("Results found, but none matched the image filter.")
+            return
 
-        st.markdown("".join(cards_html), unsafe_allow_html=True)
+        html = f"""
+<style>
+.result-grid {{
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));
+  gap:24px;
+}}
+
+.result-card {{
+  background:#0f0f0f;
+  border:1px solid #222;
+  border-radius:6px;
+  overflow:hidden;
+}}
+
+.result-image img {{
+  width:100%;
+  height:360px;
+  object-fit:contain;
+  background:#000;
+}}
+
+.result-body {{
+  padding:16px;
+}}
+
+.result-title {{
+  font-family:var(--serif);
+  font-size:20px;
+  margin-bottom:6px;
+}}
+
+.result-meta {{
+  font-size:14px;
+  color:#ccc;
+  line-height:1.45;
+}}
+
+.result-link {{
+  margin-top:10px;
+  font-size:13px;
+}}
+</style>
+
+<div class="result-grid">
+{''.join(cards)}
+</div>
+"""
+
+        components.html(
+            html,
+            height=min(350 + rendered * 420, 3000),
+            scrolling=True,
+        )
 
 # ============================================================
 # Datasets Page
