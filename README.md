@@ -184,9 +184,7 @@ Objects are always linked back to their dataset and keep a full copy of the orig
   - Easy inspection
   - Path to migrate later
 
-## Extending This
-
-Some natural next steps:
+## Next Steps
 
 - Add image embeddings & multimodal search
 - Add curator workspaces (saved sets, comparisons)
