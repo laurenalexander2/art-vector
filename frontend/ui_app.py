@@ -1,5 +1,6 @@
 import os
-from typing import List, Dict, Any
+import random
+from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -10,130 +11,266 @@ import streamlit.components.v1 as components
 # Config
 # ============================================================
 
-API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")  # your backend (ArtVector)
+MET_API_BASE = "https://collectionapi.metmuseum.org/public/collection/v1"
 
 st.set_page_config(
-    page_title="ArtVector",
+    page_title="ArtVector – Semantic Search for Collections",
     layout="wide",
 )
 
-# ============================================================
-# Styling (neutral, stable)
-# ============================================================
-
-def inject_css():
-    st.markdown(
-        """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap');
-
-html, body {
-    font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
-    background: #fafafa;
-    color: #111;
-}
-
-h1, h2, h3 {
-    font-weight: 500;
-}
-
-.result-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 20px;
-}
-
-.result-card {
-    background: #fff;
-    border: 1px solid #e5e5e5;
-    border-radius: 6px;
-    overflow: hidden;
-}
-
-.result-image {
-    width: 100%;
-    height: 220px;
-    background: #f0f0f0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 13px;
-    color: #777;
-}
-
-.result-image img {
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
-}
-
-.result-body {
-    padding: 12px 14px;
-}
-
-.result-title {
-    font-size: 15px;
-    font-weight: 500;
-    margin-bottom: 6px;
-}
-
-.result-meta {
-    font-size: 13px;
-    color: #444;
-    line-height: 1.45;
-}
-
-.result-link {
-    margin-top: 8px;
-    font-size: 12px;
-}
-</style>
-""",
-        unsafe_allow_html=True,
-    )
-
-inject_css()
+# Page order (as requested)
+PAGES = ["Semantic Search", "Datasets", "Upload & Index"]
+st.sidebar.title("ArtVector")
+page = st.sidebar.radio("Navigation", PAGES)
 
 # ============================================================
-# API helpers (timeout-safe)
+# Backend API helpers (ArtVector)
 # ============================================================
 
 def api_get(path: str, **params):
     url = f"{API_BASE}{path}"
-    try:
-        r = requests.get(url, params=params, timeout=60)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.ReadTimeout:
-        st.error(
-            "Search is taking longer than expected. "
-            "Try reducing results or selecting a dataset."
-        )
-        return None
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
+def api_post(path: str, files=None, data=None):
+    url = f"{API_BASE}{path}"
+    r = requests.post(url, files=files, data=data, timeout=60)
+    r.raise_for_status()
+    return r.json()
 
 @st.cache_data(ttl=10)
 def load_datasets() -> List[Dict[str, Any]]:
-    return api_get("/all_datasets") or []
-
+    return api_get("/all_datasets")
 
 # ============================================================
-# Image helpers (Met-only, browser-resolved)
+# Met API helpers (authoritative metadata + open access images)
 # ============================================================
 
-def met_open_access_image(obj: Dict[str, Any]) -> str | None:
-    return obj.get("primaryImageSmall") or obj.get("primaryImage") or None
-
-
-def met_restricted_image(object_id: str | None) -> str | None:
-    if not object_id:
+@st.cache_data(ttl=86400)
+def met_get_object(object_id: int) -> Optional[Dict[str, Any]]:
+    try:
+        r = requests.get(f"{MET_API_BASE}/objects/{int(object_id)}", timeout=10)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
         return None
-    # IMPORTANT: do NOT fetch or verify server-side
-    return f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{object_id}/restricted"
 
+def met_restricted_iiif_url(object_id: int) -> str:
+    return f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{int(object_id)}/restricted"
+
+@st.cache_data(ttl=86400)
+def met_restricted_exists(object_id: int) -> bool:
+    """
+    True if Met restricted IIIF endpoint returns an image.
+    Uses HEAD for speed; caches for a day.
+    """
+    url = met_restricted_iiif_url(object_id)
+    try:
+        r = requests.head(url, timeout=3, allow_redirects=True)
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        return (r.status_code == 200) and ("image" in ctype)
+    except Exception:
+        return False
+
+def extract_object_id_from_backend_obj(obj: Dict[str, Any]) -> Optional[int]:
+    """
+    Prefer Object ID from raw_metadata (CSV keys) if present, else obj["original_id"].
+    """
+    meta = obj.get("raw_metadata") or {}
+    oid = meta.get("Object ID") or meta.get("ObjectID") or meta.get("objectID")
+    if oid is None:
+        oid = obj.get("original_id")
+    if oid is None:
+        return None
+    try:
+        return int(str(oid).strip())
+    except Exception:
+        return None
+
+def met_wall_label_fields(m: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Minimal wall-label fields from Met API response.
+    """
+    title = m.get("title") or "Untitled"
+    artist = m.get("artistDisplayName") or "Unknown artist"
+    date = m.get("objectDate") or ""
+    medium = m.get("medium") or ""
+    place = m.get("culture") or m.get("country") or ""
+    object_id = str(m.get("objectID") or "")
+    link = m.get("objectURL") or (f"https://www.metmuseum.org/art/collection/search/{object_id}" if object_id else "")
+    return {
+        "title": title,
+        "artist": artist,
+        "date": date,
+        "medium": medium,
+        "place": place,
+        "object_id": object_id,
+        "link": link,
+    }
+
+def met_best_image(m: Dict[str, Any]) -> Tuple[Optional[str], bool]:
+    """
+    Returns (image_url, is_real_image)
+    - Open Access: primaryImageSmall (or primaryImage)
+    - Otherwise: restricted IIIF if it exists
+    - Else: None
+    """
+    oid = m.get("objectID")
+    if not oid:
+        return None, False
+
+    primary_small = (m.get("primaryImageSmall") or "").strip()
+    primary = (m.get("primaryImage") or "").strip()
+
+    if primary_small:
+        return primary_small, True
+    if primary:
+        return primary, True
+
+    # restricted
+    if met_restricted_exists(int(oid)):
+        return met_restricted_iiif_url(int(oid)), True
+
+    return None, False
 
 # ============================================================
-# Semantic Search Page
+# Cards (HTML)
+# ============================================================
+
+def render_cards(cards: List[Dict[str, Any]]):
+    # cards: {title, artist, date, medium, place, object_id, link, image_url, has_image}
+    html_cards = []
+    for c in cards:
+        img_block = ""
+        if c["image_url"]:
+            img_block = f"<img src='{c['image_url']}' alt='Image' />"
+        else:
+            img_block = f"""
+            <div class="placeholder">
+              <div class="placeholder-title">No image available</div>
+              <div class="placeholder-sub">Object ID: {c['object_id']}</div>
+            </div>
+            """
+
+        html_cards.append(
+            f"""
+<div class="card">
+  <div class="media">{img_block}</div>
+  <div class="body">
+    <div class="title">{c['title']}</div>
+    <div class="meta">
+      <div>{c['artist']}</div>
+      <div class="muted">{c['date']}</div>
+      <div class="muted">{c['medium']}</div>
+      <div class="muted">{c['place']}</div>
+      <div class="muted">Object ID: {c['object_id']}</div>
+    </div>
+    <div class="link"><a href="{c['link']}" target="_blank" rel="noopener">View on Met →</a></div>
+  </div>
+</div>
+"""
+        )
+
+    html = f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500&display=swap');
+
+.grid {{
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 18px;
+  padding: 6px 2px;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+}}
+
+.card {{
+  border: 1px solid rgba(0,0,0,0.12);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #fff;
+}}
+
+.media {{
+  width: 100%;
+  aspect-ratio: 4 / 5;
+  background: #f4f4f4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}}
+
+.media img {{
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}}
+
+.placeholder {{
+  width: 100%;
+  height: 100%;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  color: rgba(0,0,0,0.65);
+  text-align: center;
+  gap: 6px;
+}}
+
+.placeholder-title {{
+  font-weight: 600;
+}}
+
+.placeholder-sub {{
+  font-size: 12px;
+}}
+
+.body {{
+  padding: 12px 12px 14px 12px;
+}}
+
+.title {{
+  font-family: "Times New Roman", serif;
+  font-size: 18px;
+  line-height: 1.25;
+  margin-bottom: 8px;
+}}
+
+.meta {{
+  font-size: 13px;
+  line-height: 1.35;
+  color: rgba(0,0,0,0.80);
+}}
+
+.muted {{
+  color: rgba(0,0,0,0.55);
+}}
+
+.link {{
+  margin-top: 10px;
+  font-size: 13px;
+}}
+
+.link a {{
+  text-decoration: none;
+}}
+
+.link a:hover {{
+  text-decoration: underline;
+}}
+</style>
+
+<div class="grid">
+{''.join(html_cards)}
+</div>
+"""
+    components.html(html, height=1150, scrolling=True)
+
+# ============================================================
+# Page: Semantic Search
 # ============================================================
 
 def render_search_page():
@@ -146,103 +283,62 @@ def render_search_page():
 
     images_only = st.checkbox("Only show objects with images", value=False)
 
-    query = st.text_input(
-        "Enter a meaning-based query",
-        value="modern marble sculpture",
-    )
+    default_query = "modern marble sculpture"
+    query = st.text_input("Enter a meaning-based query", value=default_query)
 
     k = st.slider("Results to show", 5, 50, 20)
 
-    run = st.button("Search", type="primary")
+    # Auto-run once per (dataset_id, query) pair on load
+    key = f"auto_ran::{dataset_id}::{query}"
+    if key not in st.session_state:
+        st.session_state[key] = False
 
-    if not run or not query.strip():
+    run = st.button("Search", type="primary") or (not st.session_state[key] and query.strip() != "")
+    if not run:
         return
+
+    st.session_state[key] = True
 
     with st.spinner("Searching…"):
-        res = api_get(
-            "/search_text",
-            q=query,
-            limit=k,
-            dataset_id=dataset_id,
-        )
+        res = api_get("/search_text", q=query, limit=k, dataset_id=dataset_id)
 
     if not res:
+        st.warning("No results found.")
         return
 
-    cards_html = []
-    shown = 0
-
+    cards = []
     for r in res:
-        if shown >= k:
-            break
-
-        obj = r["obj"]
-
-        object_id = obj.get("original_id")
-        title = obj.get("title") or "Untitled"
-        artist = obj.get("artistDisplayName") or obj.get("artist") or "Unknown"
-        date = obj.get("objectDate") or ""
-        medium = obj.get("medium") or ""
-        culture = obj.get("culture") or obj.get("country") or ""
-
-        image_url = met_open_access_image(obj)
-        if not image_url:
-            image_url = met_restricted_image(object_id)
-
-        has_image_candidate = image_url is not None
-
-        if images_only and not has_image_candidate:
+        obj = r.get("obj") or {}
+        oid = extract_object_id_from_backend_obj(obj)
+        if oid is None:
             continue
 
-        met_link = (
-            obj.get("objectURL")
-            or (f"https://www.metmuseum.org/art/collection/search/{object_id}" if object_id else "")
+        met_obj = met_get_object(oid)
+        if not met_obj:
+            continue
+
+        fields = met_wall_label_fields(met_obj)
+        image_url, has_image = met_best_image(met_obj)
+
+        if images_only and not has_image:
+            continue
+
+        cards.append(
+            {
+                **fields,
+                "image_url": image_url,
+                "has_image": has_image,
+            }
         )
 
-        img_html = (
-            f"<img src='{image_url}' onerror=\"this.style.display='none'; this.parentElement.innerHTML='No image available';\" />"
-            if image_url
-            else "No image available"
-        )
-
-        cards_html.append(
-            f"""
-<div class="result-card">
-  <div class="result-image">
-    {img_html}
-  </div>
-  <div class="result-body">
-    <div class="result-title">{title}</div>
-    <div class="result-meta">
-      {artist}<br>
-      {date}<br>
-      {medium}<br>
-      {culture}<br>
-      Object ID: {object_id or "—"}
-    </div>
-    <div class="result-link">
-      <a href="{met_link}" target="_blank">View on Met →</a>
-    </div>
-  </div>
-</div>
-"""
-        )
-
-        shown += 1
-
-    if shown == 0:
-        st.info("No results matched the current filters.")
+    if not cards:
+        st.info("No results to display (try turning off the image filter).")
         return
 
-    components.html(
-        f"<div class='result-grid'>{''.join(cards_html)}</div>",
-        height=min(400 + shown * 260, 3000),
-        scrolling=True,
-    )
-
+    render_cards(cards)
 
 # ============================================================
-# Datasets Page (with preview)
+# Page: Datasets (combined with object preview)
 # ============================================================
 
 def render_datasets_page():
@@ -250,39 +346,58 @@ def render_datasets_page():
 
     datasets = load_datasets()
     if not datasets:
-        st.info("No datasets available.")
+        st.info("No datasets uploaded yet.")
         return
 
-    dataset_ids = [d["dataset_id"] for d in datasets]
-    selected = st.selectbox("Select a dataset", dataset_ids)
-
-    if not selected:
-        return
-
-    st.subheader("Sample objects")
-
-    objs = api_get("/all_objects", dataset_id=selected, limit=5)
-    if not objs:
-        st.info("No objects found.")
-        return
-
-    df = pd.DataFrame(
-        [
-            {
-                "Object ID": o.get("original_id"),
-                "Title": o.get("title"),
-                "Artist": o.get("artistDisplayName") or o.get("artist"),
-                "Date": o.get("objectDate"),
-                "Medium": o.get("medium"),
-            }
-            for o in objs
-        ]
-    )
+    df = pd.DataFrame(datasets)
     st.dataframe(df, use_container_width=True)
 
+    st.subheader("Preview a dataset")
+
+    dataset_ids = [d["dataset_id"] for d in datasets]
+    chosen = st.selectbox("Select a dataset to preview", dataset_ids)
+
+    # pull a small preview from your backend
+    preview_count = 5
+    with st.spinner("Loading preview…"):
+        objs = api_get("/all_objects", dataset_id=chosen, limit=200)
+
+    if not objs:
+        st.info("No objects found for this dataset.")
+        return
+
+    # choose 5 sample objects (random, stable-ish)
+    sample = random.sample(objs, k=min(preview_count, len(objs)))
+
+    cards = []
+    for o in sample:
+        oid = extract_object_id_from_backend_obj(o)
+        if oid is None:
+            continue
+        met_obj = met_get_object(oid)
+        if not met_obj:
+            continue
+
+        fields = met_wall_label_fields(met_obj)
+        image_url, has_image = met_best_image(met_obj)
+
+        # For preview: always show placeholders as needed
+        cards.append(
+            {
+                **fields,
+                "image_url": image_url,
+                "has_image": has_image,
+            }
+        )
+
+    if not cards:
+        st.info("Could not build a preview from Met API for these sample objects.")
+        return
+
+    render_cards(cards)
 
 # ============================================================
-# Upload & Index Page
+# Page: Upload & Index
 # ============================================================
 
 def render_upload_page():
@@ -298,24 +413,13 @@ def render_upload_page():
         with st.spinner("Uploading and ingesting dataset…"):
             files = {"file": (file.name, file.getvalue(), "text/csv")}
             data = {"name": dataset_name, "source_type": source_type}
-            res = requests.post(
-                f"{API_BASE}/upload_dataset", files=files, data=data
-            ).json()
+            res = api_post("/upload_dataset", files=files, data=data)
 
-        st.success(
-            f"Dataset uploaded: `{res['dataset_id']}` · {res['num_objects']} objects."
-        )
-
+        st.success(f"Dataset uploaded: `{res['dataset_id']}` · {res['num_objects']} objects.")
 
 # ============================================================
-# Navigation
+# Router
 # ============================================================
-
-st.sidebar.title("ArtVector")
-page = st.sidebar.radio(
-    "Navigation",
-    ["Semantic Search", "Datasets", "Upload & Index"],
-)
 
 if page == "Semantic Search":
     render_search_page()
