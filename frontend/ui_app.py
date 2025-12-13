@@ -123,19 +123,26 @@ def render_upload_page():
 # ============================================================
 
 def render_search_page():
+    def render_search_page():
     st.title("Semantic Search")
-
+    
     datasets = load_datasets()
     dataset_options = ["All datasets"] + [d["dataset_id"] for d in datasets]
     selected = st.selectbox("Limit search to dataset", dataset_options)
     dataset_id = None if selected == "All datasets" else selected
-
+    
     images_only = st.checkbox("Only show objects with images", value=False)
-
-    query = st.text_input("Enter a meaning-based query")
+    
+    # Pre-loaded query
+    default_query = "artworks that depict cosmic awe"
+    
+    # Input field with the default query
+    query = st.text_input("Enter a meaning-based query", value=default_query)
+    
     k = st.slider("Results to show", 6, 48, 18)
-
-    if st.button("Search") and query:
+    
+    # Automatically trigger the search on page load
+    if st.button("Search") or query == default_query:
         with st.spinner("Searching…"):
             res = api_get(
                 "/search_text",
@@ -143,7 +150,7 @@ def render_search_page():
                 limit=k,
                 dataset_id=dataset_id,
             )
-
+        
         if not res:
             st.warning("No results found.")
             return
