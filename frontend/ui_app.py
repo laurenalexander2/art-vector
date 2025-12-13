@@ -23,16 +23,6 @@ st.sidebar.title("ArtVector")
 page = st.sidebar.radio("Navigation", PAGES)
 
 # ============================================================
-# Met restricted image resolver (optimistic, correct)
-# ============================================================
-
-@st.cache_data(ttl=3600)
-def resolve_restricted_image(object_id: str) -> str | None:
-    if not object_id:
-        return None
-    return f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{object_id}/restricted"
-
-# ============================================================
 # API helpers
 # ============================================================
 
@@ -76,7 +66,7 @@ def render_upload_page():
         )
 
 # ============================================================
-# Semantic Search Page (CORRECT + PRELOADED)
+# Semantic Search Page (CORRECT, PRELOADED, IIIF-FORCED)
 # ============================================================
 
 def render_search_page():
@@ -89,7 +79,6 @@ def render_search_page():
 
     images_only = st.checkbox("Only show objects with images", value=False)
 
-    # Preloaded query (runs automatically)
     query = st.text_input(
         "Enter a meaning-based query",
         value="artworks that depict cosmic awe",
@@ -117,11 +106,25 @@ def render_search_page():
 
     for r in res:
         obj = r["obj"]
-
-        # AUTHORITATIVE SOURCE
         meta = obj.get("raw_metadata")
+
+        # STRICT correctness: do not guess
         if not meta:
-            continue  # correctness: do not guess
+            continue
+
+        object_id = meta.get("Object ID")
+        if not object_id:
+            continue
+
+        # FORCE IIIF IMAGE ATTEMPT
+        image_url = (
+            f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{object_id}/restricted"
+        )
+
+        if images_only and not object_id:
+            continue
+
+        rendered += 1
 
         title = meta.get("Title") or "Untitled"
         artist = meta.get("Artist Display Name") or "Unknown artist"
@@ -129,21 +132,13 @@ def render_search_page():
         medium = meta.get("Medium") or ""
         place = meta.get("Culture") or meta.get("Country") or ""
 
-        object_id = meta.get("Object ID")
         met_link = meta.get("Link Resource")
-
-        image_url = resolve_restricted_image(object_id)
-
-        if images_only and not image_url:
-            continue
-
-        rendered += 1
 
         cards.append(
             f"""
 <div class="result-card">
   <div class="result-image">
-    {"<img src='" + image_url + "' />" if image_url else ""}
+    <img src="{image_url}" />
   </div>
   <div class="result-body">
     <div class="result-title">{title}</div>
@@ -153,14 +148,14 @@ def render_search_page():
       {medium}<br>
       {place}
     </div>
-    {"<a href='" + met_link + "' target='_blank'>View on Met →</a>" if met_link else ""}
+    <a href="{met_link}" target="_blank">View on Met →</a>
   </div>
 </div>
 """
         )
 
     if rendered == 0:
-        st.info("Results found, but none matched the image filter.")
+        st.info("No renderable results.")
         return
 
     html = f"""
