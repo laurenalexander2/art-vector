@@ -1,5 +1,4 @@
 import os
-import json
 from typing import List, Dict, Any
 
 import pandas as pd
@@ -11,15 +10,11 @@ import streamlit as st
 # ============================================================
 
 @st.cache_data(ttl=3600)
-def resolve_restricted_image(original_id: str) -> str | None:
-    """
-    Best-effort resolver for Met restricted images.
-    Returns IIIF URL if available, else None.
-    """
-    if not original_id:
+def resolve_restricted_image(object_id: str) -> str | None:
+    if not object_id:
         return None
 
-    url = f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{original_id}/restricted"
+    url = f"https://collectionapi.metmuseum.org/api/collection/v1/iiif/{object_id}/restricted"
 
     try:
         r = requests.head(url, timeout=2)
@@ -39,44 +34,83 @@ def inject_css():
     st.markdown(
         """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500&display=swap');
-    :root {
-        --serif: "Times New Roman", serif;
-        --sans: "Inter", sans-serif;
-    }
-    html, body, [class^="css"] {
-        background:#000 !important;
-        color:#fff !important;
-        font-family:var(--sans);
-    }
-    section[data-testid="stSidebar"] {
-        background:#000 !important;
-        border-right:1px solid #222;
-        padding-top:40px !important;
-    }
-    h1,h2,h3 {
-        font-family:var(--serif);
-        font-weight:400 !important;
-    }
-    .result-card {
-        padding:20px;
-        background:#111;
-        border:1px solid #222;
-        border-radius:6px;
-        margin-bottom:20px;
-    }
-    .result-card-title {
-        font-family:var(--serif);
-        font-size:26px;
-        margin-bottom:12px;
-    }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500&display=swap');
+
+:root {
+    --serif: "Times New Roman", serif;
+    --sans: "Inter", sans-serif;
+}
+
+html, body, [class^="css"] {
+    background:#000 !important;
+    color:#fff !important;
+    font-family:var(--sans);
+}
+
+section[data-testid="stSidebar"] {
+    background:#000 !important;
+    border-right:1px solid #222;
+}
+
+h1, h2, h3 {
+    font-family:var(--serif);
+    font-weight:400 !important;
+}
+
+/* Result cards */
+
+.result-grid {
+    display:grid;
+    grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));
+    gap:24px;
+}
+
+.result-card {
+    background:#0f0f0f;
+    border:1px solid #222;
+    border-radius:6px;
+    overflow:hidden;
+    transition:transform 0.2s ease, border-color 0.2s ease;
+}
+
+.result-card:hover {
+    transform:translateY(-2px);
+    border-color:#444;
+}
+
+.result-image img {
+    width:100%;
+    height:360px;
+    object-fit:contain;
+    background:#000;
+}
+
+.result-body {
+    padding:16px;
+}
+
+.result-title {
+    font-family:var(--serif);
+    font-size:20px;
+    margin-bottom:6px;
+}
+
+.result-meta {
+    font-size:14px;
+    line-height:1.45;
+    color:#ccc;
+}
+
+.result-link {
+    margin-top:10px;
+    font-size:13px;
+}
 </style>
 """,
         unsafe_allow_html=True,
     )
 
 inject_css()
-
 
 # ============================================================
 # Config
@@ -93,7 +127,6 @@ PAGES = ["Upload & Index", "Semantic Search", "Datasets", "Object Index"]
 
 st.sidebar.title("ArtVector")
 page = st.sidebar.radio("Navigation", PAGES)
-
 
 # ============================================================
 # API helpers
@@ -120,7 +153,6 @@ def api_post(path: str, files=None, data=None, json_body=None):
 def load_datasets() -> List[Dict[str, Any]]:
     return api_get("/all_datasets")
 
-
 # ============================================================
 # Upload & Index Page
 # ============================================================
@@ -143,11 +175,9 @@ def render_upload_page():
         st.success(
             f"Dataset uploaded: `{res['dataset_id']}` · {res['num_objects']} objects."
         )
-        st.json(res)
-
 
 # ============================================================
-# Semantic Search Page (FIXED)
+# Semantic Search Page (CARD VIEW)
 # ============================================================
 
 def render_search_page():
@@ -158,13 +188,13 @@ def render_search_page():
     selected = st.selectbox("Limit search to dataset", dataset_options)
     dataset_id = None if selected == "All datasets" else selected
 
-    images_only = st.checkbox("Only show objects with images", value=False)
+    images_only = st.checkbox("Only show objects with images", value=True)
 
     query = st.text_input("Enter a meaning-based query")
-    k = st.slider("Results to show", 5, 50, 15)
+    k = st.slider("Results to show", 6, 48, 18)
 
     if st.button("Search") and query:
-        with st.spinner("Embedding query and searching…"):
+        with st.spinner("Searching…"):
             res = api_get(
                 "/search_text",
                 q=query,
@@ -176,56 +206,53 @@ def render_search_page():
             st.warning("No results found.")
             return
 
-        shown = 0
+        cards_html = ['<div class="result-grid">']
 
         for r in res:
             obj = r["obj"]
             score = r["score"]
-            title = obj.get("title") or "[Untitled]"
 
-            image_url = obj.get("image_url")
-            restricted_url = None
+            object_id = obj.get("original_id")
+            image_url = obj.get("image_url") or resolve_restricted_image(object_id)
 
-            if not image_url:
-                restricted_url = resolve_restricted_image(obj.get("original_id"))
-
-            has_any_image = bool(image_url or restricted_url)
-
-            if images_only and not has_any_image:
+            if images_only and not image_url:
                 continue
 
-            shown += 1
+            title = obj.get("title") or "Untitled"
+            artist = obj.get("artist") or "Unknown artist"
+            date = obj.get("year") or obj.get("date") or ""
+            medium = obj.get("medium") or ""
+            place = obj.get("place") or obj.get("culture") or ""
 
-            object_page = f"https://www.metmuseum.org/art/collection/search/{obj.get('original_id')}"
+            met_link = (
+                f"https://www.metmuseum.org/art/collection/search/{object_id}"
+                if object_id
+                else None
+            )
 
-            with st.expander(f"{title} — score {score:.3f}"):
-                left, right = st.columns([2, 1])
+            cards_html.append(
+                f"""
+<div class="result-card">
+    <div class="result-image">
+        {"<img src='" + image_url + "' />" if image_url else ""}
+    </div>
+    <div class="result-body">
+        <div class="result-title">{title}</div>
+        <div class="result-meta">
+            {artist}<br>
+            {date}<br>
+            {medium}<br>
+            {place}
+        </div>
+        {"<div class='result-link'><a href='" + met_link + "' target='_blank'>View on Met →</a></div>" if met_link else ""}
+    </div>
+</div>
+"""
+            )
 
-                with left:
-                    st.markdown(
-                        f"[View on Met website]({object_page})",
-                        unsafe_allow_html=True,
-                    )
-                    st.write(f"**Dataset:** `{obj['dataset_id']}`")
-                    st.write(f"**Artist:** {obj.get('artist') or 'Unknown'}")
-                    st.write(f"**Original ID:** {obj.get('original_id')}")
-                    st.json(obj["raw_metadata"])
+        cards_html.append("</div>")
 
-                with right:
-                    if image_url:
-                        st.image(image_url, caption=title, use_container_width=True)
-                    elif restricted_url:
-                        st.image(
-                            restricted_url,
-                            caption=f"{title} (restricted)",
-                            use_container_width=True,
-                        )
-                    else:
-                        st.caption("No image available")
-
-        if images_only and shown == 0:
-            st.info("No results with images found for this query.")
-
+        st.markdown("".join(cards_html), unsafe_allow_html=True)
 
 # ============================================================
 # Datasets Page
@@ -233,15 +260,8 @@ def render_search_page():
 
 def render_datasets_page():
     st.title("Datasets")
-
-    datasets = load_datasets()
-    if not datasets:
-        st.info("No datasets uploaded yet.")
-        return
-
-    df = pd.DataFrame(datasets)
+    df = pd.DataFrame(load_datasets())
     st.dataframe(df)
-
 
 # ============================================================
 # Object Index Page
@@ -257,28 +277,9 @@ def render_object_index_page():
 
     limit = st.slider("Max objects to load", 100, 2000, 500, step=100)
 
-    with st.spinner("Loading objects…"):
-        objs = api_get("/all_objects", dataset_id=dataset_id, limit=limit)
-
-    if not objs:
-        st.info("No objects found.")
-        return
-
-    records = [
-        {
-            "object_uid": o["object_uid"],
-            "dataset_id": o["dataset_id"],
-            "original_id": o.get("original_id"),
-            "title": o.get("title"),
-            "artist": o.get("artist"),
-            "image_url": o.get("image_url"),
-        }
-        for o in objs
-    ]
-
-    df = pd.DataFrame(records)
+    objs = api_get("/all_objects", dataset_id=dataset_id, limit=limit)
+    df = pd.DataFrame(objs)
     st.dataframe(df)
-
 
 # ============================================================
 # Page Router
